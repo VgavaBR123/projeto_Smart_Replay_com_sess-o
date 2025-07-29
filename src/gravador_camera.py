@@ -45,6 +45,9 @@ from hierarchical_video_manager import HierarchicalVideoManager
 # Importação para sistema de logs limpos
 from system_logger import log_info, log_success, log_warning, log_error, log_debug, system_logger
 
+# Importação para sistema de marca d'água
+from watermark_manager import WatermarkManager
+
 
 class CameraRecorder:
     def __init__(self, camera_url, camera_name, fps=30, buffer_seconds=25):
@@ -70,6 +73,10 @@ class CameraRecorder:
         # Lock para thread safety
         self.buffer_lock = threading.Lock()
         self.saving = False  # Flag para pausar verificações durante salvamento
+        
+        # Sistema de marca d'água
+        self.watermark_manager = None
+        self._init_watermark_manager()
         
     def connect_camera(self):
         """Conecta à câmera IP"""
@@ -229,6 +236,25 @@ class CameraRecorder:
             if len(self.frame_buffer) > 0:
                 return self.frame_buffer[-1]
         return None
+    
+    def _init_watermark_manager(self):
+        """Inicializa o sistema de marca d'água"""
+        try:
+            # Verificar se a marca d'água está habilitada
+            watermark_enabled = os.getenv('WATERMARK_ENABLED', 'true').lower() == 'true'
+            
+            if watermark_enabled:
+                watermark_path = os.getenv('WATERMARK_PATH', 
+                    r"c:\Users\Vinicius\PycharmProjects\Projeto_Camera_Seguranca_Otimizado\marca_dagua\Smart Byte - Horizontal.png")
+                
+                self.watermark_manager = WatermarkManager(watermark_path)
+                print(f"🎨 [{self.camera_name}] Sistema de marca d'água inicializado")
+            else:
+                print(f"⚪ [{self.camera_name}] Marca d'água desabilitada")
+                
+        except Exception as e:
+            print(f"❌ [{self.camera_name}] Erro ao inicializar marca d'água: {e}")
+            self.watermark_manager = None
 
     def compress_video_for_upload(self, input_path, output_path):
         """Comprime vídeo usando FFmpeg para upload otimizado"""
@@ -435,6 +461,10 @@ class CameraRecorder:
                             print(f"⏰ [{self.camera_name}] Timeout após {elapsed:.1f}s - salvando {frames_written} frames")
                             break
                         
+                        # Aplicar marca d'água se habilitada
+                        if self.watermark_manager:
+                            frame = self.watermark_manager.apply_watermark(frame)
+                        
                         out.write(frame)
                         frames_written += 1
                         
@@ -443,7 +473,8 @@ class CameraRecorder:
                             progress = (i / len(frames)) * 100
                             elapsed = time.time() - start_time
                             fps_write = frames_written / elapsed if elapsed > 0 else 0
-                            print(f"📈 [{self.camera_name}] Progresso: {frames_written} frames salvos ({progress:.1f}%) - {fps_write:.1f} fps escrita")
+                            watermark_status = "com marca d'água" if self.watermark_manager else "sem marca d'água"
+                            print(f"📈 [{self.camera_name}] Progresso: {frames_written} frames salvos ({progress:.1f}%) - {fps_write:.1f} fps escrita ({watermark_status})")
                     else:
                         print(f"⚠️  [{self.camera_name}] Frame {i} é None")
                         
@@ -967,27 +998,36 @@ class CameraSystem:
                                         log_error(f"Exceção no registro replay para {camera_name}: {replay_error}")
                                         # NÃO interrompe o fluxo principal
                                     
+                                    # EXCLUSÃO AUTOMÁTICA: Excluir arquivo local após upload bem-sucedido
+                                    if self._excluir_arquivo_local_apos_upload(output_path, camera_name):
+                                        print(f" → ✅ Upload completo e arquivo local removido")
+                                    else:
+                                        print(f" → ⚠️ Upload completo mas arquivo local não foi removido")
+                                    
                                     upload_results.append({
                                         'camera': camera_name,
                                         'success': True,
                                         'local_path': output_path,
                                         'bucket_path': bucket_path,
                                         'upload_time': upload_time,
-                                        'file_size': file_size
+                                        'file_size': file_size,
+                                        'local_file_deleted': True  # Indicar que o arquivo foi excluído
                                     })
                                 else:
                                     print(f" → ⚠️ Verificação falhou")
                                     upload_results.append({
                                         'camera': camera_name,
                                         'success': False,
-                                        'error': verify_result['message']
+                                        'error': verify_result['message'],
+                                        'local_file_deleted': False  # Arquivo mantido devido ao erro
                                     })
                             else:
                                 print(f" → ❌ Upload falhou: {upload_result['message']}")
                                 upload_results.append({
                                     'camera': camera_name,
                                     'success': False,
-                                    'error': upload_result['message']
+                                    'error': upload_result['message'],
+                                    'local_file_deleted': False  # Arquivo mantido devido ao erro
                                 })
                                 
                         except Exception as upload_error:
@@ -995,14 +1035,16 @@ class CameraSystem:
                             upload_results.append({
                                 'camera': camera_name,
                                 'success': False,
-                                'error': str(upload_error)
+                                'error': str(upload_error),
+                                'local_file_deleted': False  # Arquivo mantido devido ao erro
                             })
                     else:
                         print(f" - SEM UPLOAD")
                         upload_results.append({
                             'camera': camera_name,
                             'success': False,
-                            'error': 'Upload não autorizado - dispositivo não associado'
+                            'error': 'Upload não autorizado - dispositivo não associado',
+                            'local_file_deleted': False  # Arquivo mantido - upload não autorizado
                         })
                         
                 else:
@@ -1025,22 +1067,26 @@ class CameraSystem:
         if saved_files:
             successful_uploads = [r for r in upload_results if r['success']]
             failed_uploads = [r for r in upload_results if not r['success']]
+            deleted_files = [r for r in upload_results if r.get('local_file_deleted', False)]
             
             if upload_enabled:
                 print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} vídeos salvos localmente e {len(successful_uploads)}/{len(saved_files)} enviados para bucket")
+                print(f"🗑️ Limpeza: {len(deleted_files)}/{len(successful_uploads)} arquivos locais excluídos automaticamente")
                 
                 if successful_uploads:
                     total_upload_time = sum(r.get('upload_time', 0) for r in successful_uploads)
                     total_size = sum(r.get('file_size', 0) for r in successful_uploads)
                     print(f"⏱️ Tempo total de upload: {total_upload_time:.1f}s")
                     print(f"📦 Tamanho total enviado: {total_size:.1f} MB")
+                    print(f"💾 Espaço local liberado: {total_size:.1f} MB")
                 
                 if failed_uploads:
-                    print(f"❌ Falhas no upload:")
+                    print(f"❌ Falhas no upload (arquivos mantidos localmente):")
                     for result in failed_uploads:
                         print(f"   • {result['camera']}: {result['error']}")
             else:
                 print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} localmente - Upload não autorizado")
+                print(f"🗑️ Limpeza: 0 arquivos excluídos (upload desabilitado)")
         
         if failed_cameras:
             print(f"\n❌ Falha ao salvar câmeras: {', '.join(failed_cameras)}")
@@ -1261,6 +1307,70 @@ class CameraSystem:
             log_error(f"❌ UUID de emergência gerado para {camera_name}: {camera_uuid}")
             log_error(f"❌ Este UUID definitivamente não existe na tabela - registro replay falhará")
             return camera_uuid
+
+    def _excluir_arquivo_local_apos_upload(self, file_path, camera_name):
+        """
+        Exclui o arquivo de vídeo local após upload bem-sucedido.
+        
+        Args:
+            file_path (str): Caminho completo do arquivo local
+            camera_name (str): Nome da câmera para logs
+            
+        Returns:
+            bool: True se a exclusão foi bem-sucedida
+        """
+        try:
+            if os.path.exists(file_path):
+                # Obter tamanho do arquivo antes da exclusão para logs
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                
+                # Excluir o arquivo
+                os.remove(file_path)
+                
+                print(f" → 🗑️ Arquivo local excluído ({file_size:.1f} MB liberados)")
+                log_info(f"Arquivo local excluído após upload: {file_path}")
+                
+                # Verificar se a pasta ficou vazia e remover se necessário
+                self._limpar_pastas_vazias(os.path.dirname(file_path))
+                
+                return True
+            else:
+                log_warning(f"Arquivo não encontrado para exclusão: {file_path}")
+                return False
+                
+        except Exception as e:
+            print(f" → ❌ Erro ao excluir arquivo local: {e}")
+            log_error(f"Erro ao excluir arquivo local {file_path}: {e}")
+            return False
+
+    def _limpar_pastas_vazias(self, dir_path):
+        """
+        Remove pastas vazias recursivamente, mantendo a estrutura base.
+        
+        Args:
+            dir_path (str): Caminho do diretório para verificar
+        """
+        try:
+            # Não remover a pasta raiz do projeto
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(current_dir)
+            
+            # Não remover pastas muito próximas da raiz
+            if dir_path == project_root or len(os.path.relpath(dir_path, project_root).split(os.sep)) < 3:
+                return
+            
+            # Verificar se a pasta está vazia
+            if os.path.exists(dir_path) and os.path.isdir(dir_path):
+                if not os.listdir(dir_path):
+                    os.rmdir(dir_path)
+                    log_debug(f"Pasta vazia removida: {dir_path}")
+                    
+                    # Verificar pasta pai recursivamente
+                    parent_dir = os.path.dirname(dir_path)
+                    self._limpar_pastas_vazias(parent_dir)
+                    
+        except Exception as e:
+            log_debug(f"Erro ao limpar pasta vazia {dir_path}: {e}")
 
     def _validar_url_completa(self, url):
         """
