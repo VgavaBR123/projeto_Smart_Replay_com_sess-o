@@ -19,7 +19,7 @@ import numpy as np
 import threading
 import time
 import queue
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
 
@@ -1238,7 +1238,7 @@ class CameraSystem:
                                         replay_result = self.replay_manager.insert_replay_record(
                                             camera_id=camera_uuid,
                                             video_url=public_url,
-                                            timestamp_video=datetime.now(),
+                                            timestamp_video=datetime.now(timezone.utc),
                                             bucket_path=bucket_path
                                         )
                                         

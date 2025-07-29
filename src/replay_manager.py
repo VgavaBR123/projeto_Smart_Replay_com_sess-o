@@ -9,7 +9,7 @@ Integra com o sistema existente de câmeras de segurança.
 import os
 import uuid
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Union
 from dotenv import load_dotenv
@@ -88,7 +88,7 @@ class ReplayManager:
         Args:
             camera_id (str): UUID da câmera
             video_url (str): URL do vídeo original
-            timestamp_video (datetime): Momento da gravação
+            timestamp_video (datetime): Momento da gravação (deve estar em UTC)
             bucket_path (str): Caminho no bucket
             
         Returns:
@@ -281,7 +281,7 @@ class ReplayManager:
         Args:
             camera_id (str): UUID da câmera
             video_url (str): URL do vídeo original (deve ser URL completa)
-            timestamp_video (datetime): Momento da gravação
+            timestamp_video (datetime): Momento da gravação (deve estar em UTC)
             bucket_path (str): Caminho no bucket para gerar URL assinada
             
         Returns:
@@ -320,8 +320,8 @@ class ReplayManager:
                 'camera_id': camera_id,
                 'public_video_url': signed_url,  # URL assinada completa
                 'watermark_status': 'pending',  # Marca d'água pendente
-                'created_at': datetime.now().isoformat(),
-                'updated_at': datetime.now().isoformat()
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'updated_at': datetime.now(timezone.utc).isoformat()
             }
             
             log_debug(f"Dados preparados para inserção: camera_id={camera_id}, status=concluido")
@@ -363,7 +363,7 @@ class ReplayManager:
             update_data = {
                 'public_video_url': public_video_url,
                 'watermark_status': watermark_status,
-                'updated_at': datetime.now().isoformat()
+                'updated_at': datetime.now(timezone.utc).isoformat()
             }
             
             # Atualizar registro
@@ -386,8 +386,8 @@ class ReplayManager:
         
         Args:
             camera_id (str): UUID da câmera
-            start_date (datetime, optional): Data de início
-            end_date (datetime, optional): Data de fim
+            start_date (datetime, optional): Data de início (deve estar em UTC)
+            end_date (datetime, optional): Data de fim (deve estar em UTC)
             
         Returns:
             dict: Resultado da busca
@@ -444,8 +444,8 @@ class ReplayManager:
             
             # Dados para atualização
             update_data = {
-                'status_envio': status,
-                'updated_at': datetime.now().isoformat()
+                'status': status,
+                'updated_at': datetime.now(timezone.utc).isoformat()
             }
             
             # Adicionar mensagem de erro se fornecida
