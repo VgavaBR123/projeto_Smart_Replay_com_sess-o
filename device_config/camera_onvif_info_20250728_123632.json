@@ -1,0 +1,78 @@
+{
+  "camera_1": {
+    "camera_id": 1,
+    "configuracao": {
+      "ip": "192.168.101.201",
+      "rtsp_url": "rtsp://admin:123456@192.168.101.201:554/profile1",
+      "usuario": "admin"
+    },
+    "dispositivo": {
+      "fabricante": "Motorola",
+      "modelo": "MTIDM022603",
+      "serial_number": "585B6901CEFD",
+      "device_uuid": "4b5d3280-f2c9-5f9a-a50d-d7d67670c636",
+      "firmware_version": "4.2",
+      "hardware_id": "1.4-1512429"
+    },
+    "conexao": {
+      "status": "conectado",
+      "timestamp": "2025-07-28 12:36:31",
+      "capacidades": {
+        "onvif_service_url": "http://192.168.101.201:80/onvif/device_service",
+        "media_service": true,
+        "ptz_service": false,
+        "imaging_service": true,
+        "events_service": true
+      },
+      "rede": {
+        "interface_ativa": true,
+        "endereco_ip": "192.168.101.201",
+        "mascara_rede": 24,
+        "interface_nome": "eth0"
+      },
+      "horario_sistema": {
+        "timezone": "AMT4AMST,M10.3.0/0,M2.3.0/0",
+        "horario_local": "2025-07-28 12:36:31",
+        "sincronizado": true
+      }
+    }
+  },
+  "camera_2": {
+    "camera_id": 2,
+    "configuracao": {
+      "ip": "192.168.101.202",
+      "rtsp_url": "rtsp://admin:123456@192.168.101.202:554/profile1",
+      "usuario": "admin"
+    },
+    "dispositivo": {
+      "fabricante": "Motorola",
+      "modelo": "MTIDM022603",
+      "serial_number": "585B6901CE42",
+      "device_uuid": "4e58f064-6d66-5193-a6be-c5529aa336cc",
+      "firmware_version": "4.2",
+      "hardware_id": "1.4-1512429"
+    },
+    "conexao": {
+      "status": "conectado",
+      "timestamp": "2025-07-28 12:36:31",
+      "capacidades": {
+        "onvif_service_url": "http://192.168.101.202:80/onvif/device_service",
+        "media_service": true,
+        "ptz_service": false,
+        "imaging_service": true,
+        "events_service": true
+      },
+      "rede": {
+        "interface_ativa": true,
+        "endereco_ip": "192.168.101.202",
+        "mascara_rede": 24,
+        "interface_nome": "eth0"
+      },
+      "horario_sistema": {
+        "timezone": "AMT4AMST,M10.3.0/0,M2.3.0/0",
+        "horario_local": "2025-07-28 12:36:30",
+        "sincronizado": true
+      }
+    }
+  }
+}

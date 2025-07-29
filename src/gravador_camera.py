@@ -1,0 +1,1164 @@
+#!/usr/bin/env python3
+"""
+Sistema de Gravação de Câmeras IP com Buffer Circular
+Grava os últimos 25 segundos diretamente em formato otimizado quando a tecla 'S' é pressionada
+"""
+
+import os
+import sys
+import time
+
+# Configurações para suprimir avisos do FFmpeg/OpenCV - DEVE ser antes de importar cv2
+os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'  # Suprimir logs do FFmpeg
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'     # Apenas erros críticos do OpenCV
+os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'     # Desabilitar debug do VideoIO
+os.environ['FFMPEG_LOG_LEVEL'] = 'quiet'     # FFmpeg silencioso
+
+import cv2
+import numpy as np
+import threading
+import time
+import queue
+from datetime import datetime
+from collections import deque
+from pathlib import Path
+
+# Configurar OpenCV para suprimir logs
+cv2.setLogLevel(0)  # Suprimir logs do OpenCV
+
+# Importações para Device ID e QR Code
+from device_manager import DeviceManager
+from qr_generator import QRCodeGenerator
+
+# Importação para informações ONVIF das câmeras
+from onvif_device_info import ONVIFDeviceManager
+
+# Importação para gerenciamento do Supabase
+from supabase_manager import SupabaseManager
+
+# Importação para sistema de logs limpos
+from system_logger import log_info, log_success, log_warning, log_error, log_debug, system_logger
+
+
+class CameraRecorder:
+    def __init__(self, camera_url, camera_name, fps=30, buffer_seconds=25):
+        self.camera_url = camera_url
+        self.camera_name = camera_name
+        self.fps = fps
+        self.buffer_seconds = buffer_seconds
+        self.buffer_size = fps * buffer_seconds  # 25 segundos de frames
+        
+        # Buffer circular para armazenar frames
+        self.frame_buffer = deque(maxlen=self.buffer_size)
+        self.timestamp_buffer = deque(maxlen=self.buffer_size)
+        
+        # Threading
+        self.capture_thread = None
+        self.running = False
+        
+        # Câmera
+        self.cap = None
+        self.frame_width = None
+        self.frame_height = None
+        
+        # Lock para thread safety
+        self.buffer_lock = threading.Lock()
+        self.saving = False  # Flag para pausar verificações durante salvamento
+        
+    def connect_camera(self):
+        """Conecta à câmera IP"""
+        print(f"Conectando à câmera {self.camera_name}: {self.camera_url}")
+        
+        self.cap = cv2.VideoCapture(self.camera_url)
+        
+        if not self.cap.isOpened():
+            print(f"Erro: Não foi possível conectar à câmera {self.camera_name}")
+            return False
+            
+        # Configurar propriedades da câmera para reduzir latência
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Buffer mínimo
+        self.cap.set(cv2.CAP_PROP_FPS, 30)  # Forçar 30 FPS
+        
+        # Configurações adicionais para RTSP
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        
+        # Obter resolução da câmera
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        print(f"Câmera {self.camera_name} conectada:")
+        print(f"  Resolução: {self.frame_width}x{self.frame_height}")
+        print(f"  FPS: {actual_fps}")
+        
+        return True
+    
+    def start_capture(self):
+        """Inicia a captura em thread separada"""
+        if not self.connect_camera():
+            return False
+            
+        self.running = True
+        self.capture_thread = threading.Thread(target=self._capture_loop)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+        
+        print(f"✅ Captura iniciada para {self.camera_name}")
+        print(f"   Buffer configurado para: {self.buffer_seconds}s ({self.buffer_size} frames)")
+        
+        return True
+    
+    def stop_capture(self):
+        """Para a captura"""
+        self.running = False
+        if self.capture_thread:
+            self.capture_thread.join()
+        if self.cap:
+            self.cap.release()
+    
+    def _capture_loop(self):
+        """Loop principal de captura de frames"""
+        consecutive_errors = 0
+        last_health_check = time.time()
+        last_buffer_report = time.time()
+        buffer_fill_reported = False  # Para reportar quando o buffer estiver cheio pela primeira vez
+        
+        while self.running:
+            ret, frame = self.cap.read()
+            
+            if ret:
+                consecutive_errors = 0
+                current_time = time.time()
+                
+                with self.buffer_lock:
+                    self.frame_buffer.append(frame)
+                    self.timestamp_buffer.append(current_time)
+                    
+                    # Manter apenas os frames do buffer configurado
+                    while len(self.frame_buffer) > self.buffer_size:
+                        self.frame_buffer.popleft()
+                        self.timestamp_buffer.popleft()
+                    
+                    # Reportar quando o buffer estiver cheio pela primeira vez
+                    if not buffer_fill_reported and len(self.frame_buffer) >= self.buffer_size * 0.95:
+                        buffer_duration = self.timestamp_buffer[-1] - self.timestamp_buffer[0] if len(self.timestamp_buffer) > 1 else 0
+                        print(f"🎯 {self.camera_name}: Buffer inicial preenchido - {len(self.frame_buffer)}/{self.buffer_size} frames ({buffer_duration:.1f}s)")
+                        buffer_fill_reported = True
+                
+                # Relatório de status do buffer a cada 30 segundos
+                if current_time - last_buffer_report > 30:
+                    with self.buffer_lock:
+                        buffer_count = len(self.frame_buffer)
+                        if len(self.timestamp_buffer) > 1:
+                            buffer_duration = self.timestamp_buffer[-1] - self.timestamp_buffer[0]
+                            print(f"📊 {self.camera_name}: Buffer atual {buffer_count}/{self.buffer_size} frames ({buffer_duration:.1f}s)")
+                        else:
+                            print(f"📊 {self.camera_name}: Buffer atual {buffer_count}/{self.buffer_size} frames")
+                    last_buffer_report = current_time
+                
+                # Verificação de saúde do buffer (apenas se não estiver salvando)
+                if not self.saving and current_time - last_health_check > 10:
+                    self._check_buffer_health()
+                    last_health_check = current_time
+                    
+            else:
+                consecutive_errors += 1
+                print(f"⚠️  Erro na captura {self.camera_name} (erro #{consecutive_errors})")
+                
+                # Tentar reconectar após muitos erros
+                if consecutive_errors >= 30:
+                    print(f"🔄 Tentando reconectar {self.camera_name} após {consecutive_errors} erros...")
+                    if self._reconnect_camera():
+                        consecutive_errors = 0
+                        buffer_fill_reported = False  # Reset para reportar novamente após reconexão
+                    else:
+                        time.sleep(1)  # Esperar mais tempo se a reconexão falhar
+                
+                time.sleep(0.033)  # ~30 FPS em caso de erro
+    
+    def _check_buffer_health(self):
+        """Verifica a saúde do buffer e reporta problemas"""
+        # Não verificar durante salvamento para evitar interferência
+        if self.saving:
+            return
+            
+        with self.buffer_lock:
+            if len(self.timestamp_buffer) < 2:
+                return
+                
+            buffer_duration = self.timestamp_buffer[-1] - self.timestamp_buffer[0]
+            expected_frames = self.buffer_seconds * self.fps
+            current_frames = len(self.frame_buffer)
+            
+            # Verificar se o buffer está muito abaixo do esperado
+            if current_frames < expected_frames * 0.8:  # 80% do esperado
+                print(f"⚠️  Câmera {self.camera_name}: Buffer baixo - {current_frames}/{expected_frames} frames ({buffer_duration:.1f}s)")
+            elif current_frames >= expected_frames * 0.95:  # Buffer quase cheio
+                print(f"✅ Câmera {self.camera_name}: Buffer saudável - {current_frames}/{expected_frames} frames ({buffer_duration:.1f}s)")
+    
+    def _reconnect_camera(self):
+        """Tenta reconectar a câmera"""
+        try:
+            if self.cap:
+                self.cap.release()
+            
+            print(f"Reconectando câmera {self.camera_name}...")
+            self.cap = cv2.VideoCapture(self.camera_url)
+            
+            if self.cap.isOpened():
+                # Reconfigurar propriedades
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+                print(f"✅ Câmera {self.camera_name} reconectada com sucesso")
+            else:
+                print(f"❌ Falha ao reconectar câmera {self.camera_name}")
+                
+        except Exception as e:
+            print(f"❌ Erro na reconexão da câmera {self.camera_name}: {e}")
+
+    def get_latest_frame(self):
+        """Retorna o frame mais recente do buffer"""
+        with self.buffer_lock:
+            if len(self.frame_buffer) > 0:
+                return self.frame_buffer[-1]
+        return None
+
+    def compress_video_for_upload(self, input_path, output_path):
+        """Comprime vídeo usando FFmpeg para upload otimizado"""
+        try:
+            import subprocess
+            
+            # Configurações de compressão do config.env
+            compression_enabled = os.getenv('VIDEO_COMPRESSION_ENABLED', 'true').lower() == 'true'
+            if not compression_enabled:
+                print(f"📁 [{self.camera_name}] Compressão desabilitada - usando arquivo original")
+                return input_path
+            
+            crf = int(os.getenv('VIDEO_QUALITY_CRF', '28'))
+            bitrate = int(os.getenv('VIDEO_BITRATE_KBPS', '2000'))
+            fps = int(os.getenv('VIDEO_FPS_UPLOAD', '15'))
+            width = int(os.getenv('VIDEO_SCALE_WIDTH', '1280'))
+            height = int(os.getenv('VIDEO_SCALE_HEIGHT', '720'))
+            max_size_mb = int(os.getenv('MAX_FILE_SIZE_MB', '50'))
+            
+            print(f"🗜️ [{self.camera_name}] Comprimindo para upload...")
+            print(f"   📐 Resolução: {width}x{height}")
+            print(f"   🎬 FPS: {fps}")
+            print(f"   📊 CRF: {crf}, Bitrate: {bitrate}k")
+            print(f"   📦 Tamanho máximo: {max_size_mb}MB")
+            
+            # Comando FFmpeg otimizado
+            cmd = [
+                'ffmpeg', '-y',  # Sobrescrever arquivo se existir
+                '-i', input_path,  # Arquivo de entrada
+                '-c:v', 'libx264',  # Codec de vídeo
+                '-preset', 'fast',  # Preset de velocidade
+                '-crf', str(crf),  # Qualidade (18-28 é bom)
+                '-maxrate', f'{bitrate}k',  # Bitrate máximo
+                '-bufsize', f'{bitrate * 2}k',  # Buffer size
+                '-vf', f'scale={width}:{height}',  # Redimensionar
+                '-r', str(fps),  # FPS
+                '-movflags', '+faststart',  # Otimizar para streaming
+                '-loglevel', 'error',  # Apenas erros
+                output_path
+            ]
+            
+            start_time = time.time()
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            compression_time = time.time() - start_time
+            
+            if result.returncode == 0:
+                if os.path.exists(output_path):
+                    original_size = os.path.getsize(input_path) / (1024*1024)
+                    compressed_size = os.path.getsize(output_path) / (1024*1024)
+                    compression_ratio = (1 - compressed_size/original_size) * 100
+                    
+                    print(f"✅ [{self.camera_name}] Compressão concluída em {compression_time:.1f}s")
+                    print(f"   📊 {original_size:.1f}MB → {compressed_size:.1f}MB ({compression_ratio:.1f}% redução)")
+                    
+                    # Verificar se está dentro do limite
+                    if compressed_size <= max_size_mb:
+                        print(f"   ✅ Tamanho dentro do limite ({max_size_mb}MB)")
+                        return output_path
+                    else:
+                        print(f"   ⚠️ Arquivo ainda muito grande ({compressed_size:.1f}MB > {max_size_mb}MB)")
+                        # Tentar compressão mais agressiva
+                        return self._compress_aggressive(input_path, output_path, max_size_mb)
+                else:
+                    print(f"❌ [{self.camera_name}] Arquivo comprimido não foi criado")
+                    return None
+            else:
+                print(f"❌ [{self.camera_name}] Erro na compressão FFmpeg:")
+                print(f"   {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            print(f"⏰ [{self.camera_name}] Timeout na compressão (5min)")
+            return None
+        except FileNotFoundError:
+            print(f"❌ [{self.camera_name}] FFmpeg não encontrado - usando arquivo original")
+            return input_path
+        except Exception as e:
+            print(f"❌ [{self.camera_name}] Erro na compressão: {e}")
+            return None
+    
+    def _compress_aggressive(self, input_path, output_path, max_size_mb):
+        """Compressão mais agressiva se o arquivo ainda estiver muito grande"""
+        try:
+            import subprocess
+            
+            print(f"🗜️ [{self.camera_name}] Aplicando compressão agressiva...")
+            
+            # Configurações mais agressivas
+            aggressive_output = output_path.replace('.mp4', '_aggressive.mp4')
+            
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '32',  # Qualidade mais baixa
+                '-maxrate', '1000k',  # Bitrate menor
+                '-bufsize', '2000k',
+                '-vf', 'scale=960:540',  # Resolução menor
+                '-r', '12',  # FPS menor
+                '-movflags', '+faststart',
+                '-loglevel', 'error',
+                aggressive_output
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0 and os.path.exists(aggressive_output):
+                aggressive_size = os.path.getsize(aggressive_output) / (1024*1024)
+                print(f"   📊 Compressão agressiva: {aggressive_size:.1f}MB")
+                
+                if aggressive_size <= max_size_mb:
+                    # Remover arquivo intermediário
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    os.rename(aggressive_output, output_path)
+                    print(f"   ✅ Tamanho aceitável após compressão agressiva")
+                    return output_path
+                else:
+                    print(f"   ❌ Ainda muito grande mesmo com compressão agressiva")
+                    return None
+            else:
+                print(f"   ❌ Falha na compressão agressiva")
+                return None
+                
+        except Exception as e:
+            print(f"❌ [{self.camera_name}] Erro na compressão agressiva: {e}")
+            return None
+
+    def save_last_25_seconds(self, output_path):
+        """Salva os últimos 25 segundos diretamente em formato otimizado"""
+        print(f"🎬 [{self.camera_name}] Iniciando salvamento otimizado...")
+        
+        # Marcar que está salvando para pausar verificações
+        self.saving = True
+        print(f"🔒 [{self.camera_name}] Flag saving ativada")
+        
+        try:
+            print(f"🔄 [{self.camera_name}] Copiando buffer com lock...")
+            with self.buffer_lock:
+                if len(self.frame_buffer) == 0:
+                    print(f"❌ [{self.camera_name}] Buffer vazio")
+                    return False
+                    
+                frames = list(self.frame_buffer)
+                timestamps = list(self.timestamp_buffer)
+                print(f"📊 [{self.camera_name}] Buffer copiado: {len(frames)} frames, {len(timestamps)} timestamps")
+            
+            # Verificar se há frames suficientes
+            min_frames = self.fps * 5  # Pelo menos 5 segundos
+            if len(frames) < min_frames:
+                print(f"❌ [{self.camera_name}] Buffer insuficiente: {len(frames)} frames (mínimo: {min_frames})")
+                return False
+            
+            # Calcular tempo real do buffer
+            if len(timestamps) > 1:
+                buffer_duration = timestamps[-1] - timestamps[0]
+                real_fps = len(frames) / buffer_duration if buffer_duration > 0 else 0
+                
+                # Alertar se o buffer está muito abaixo do esperado
+                expected_duration = self.buffer_seconds
+                if buffer_duration < expected_duration * 0.8:  # 80% do esperado
+                    print(f"⚠️  [{self.camera_name}] Buffer curto - {buffer_duration:.1f}s de {expected_duration}s esperados")
+                
+                print(f"📊 [{self.camera_name}] {len(frames)} frames, {buffer_duration:.1f}s, FPS real: {real_fps:.1f}")
+            
+            # Criar pasta se não existir
+            print(f"📁 [{self.camera_name}] Criando diretório: {os.path.dirname(output_path)}")
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Configurar codec otimizado H.264
+            print(f"🎥 [{self.camera_name}] Configurando VideoWriter otimizado...")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Usar mp4v em vez de H264 para compatibilidade
+            print(f"📐 [{self.camera_name}] Resolução: {self.frame_width}x{self.frame_height}")
+            
+            # Usar FPS reduzido para arquivo menor
+            optimized_fps = int(os.getenv('VIDEO_FPS_UPLOAD', '15'))
+            
+            # Criar arquivo temporário primeiro
+            temp_output = output_path.replace('.mp4', '_temp.mp4')
+            out = cv2.VideoWriter(temp_output, fourcc, optimized_fps, 
+                                 (self.frame_width, self.frame_height))
+            
+            if not out.isOpened():
+                print(f"❌ [{self.camera_name}] Erro ao criar VideoWriter")
+                return False
+            
+            print(f"✅ [{self.camera_name}] VideoWriter otimizado configurado (MP4V, {optimized_fps} FPS)")
+            
+            # Calcular step para manter FPS desejado
+            frame_step = max(1, int(self.fps / optimized_fps))
+            print(f"💾 [{self.camera_name}] Salvando frames otimizados (step: {frame_step})...")
+            
+            frames_written = 0
+            start_time = time.time()
+            
+            for i in range(0, len(frames), frame_step):
+                try:
+                    frame = frames[i]
+                    if frame is not None:
+                        # Verificar timeout (máximo 2 minutos)
+                        elapsed = time.time() - start_time
+                        if elapsed > 120:  # 2 minutos
+                            print(f"⏰ [{self.camera_name}] Timeout após {elapsed:.1f}s - salvando {frames_written} frames")
+                            break
+                        
+                        out.write(frame)
+                        frames_written += 1
+                        
+                        # Progress report a cada 50 frames salvos
+                        if frames_written % 50 == 0:
+                            progress = (i / len(frames)) * 100
+                            elapsed = time.time() - start_time
+                            fps_write = frames_written / elapsed if elapsed > 0 else 0
+                            print(f"📈 [{self.camera_name}] Progresso: {frames_written} frames salvos ({progress:.1f}%) - {fps_write:.1f} fps escrita")
+                    else:
+                        print(f"⚠️  [{self.camera_name}] Frame {i} é None")
+                        
+                except Exception as e:
+                    print(f"❌ [{self.camera_name}] Erro ao escrever frame {i}: {e}")
+                    continue
+            
+            print(f"🔚 [{self.camera_name}] Finalizando arquivo temporário...")
+            total_time = time.time() - start_time
+            print(f"⏱️  [{self.camera_name}] Tempo total de escrita: {total_time:.1f}s")
+            
+            out.release()
+            
+            # Verificar se o arquivo temporário foi criado
+            if os.path.exists(temp_output):
+                temp_size = os.path.getsize(temp_output) / (1024*1024)
+                print(f"📏 [{self.camera_name}] Arquivo temporário: {temp_size:.1f} MB, Frames: {frames_written}")
+                
+                # Comprimir para upload se habilitado
+                compression_enabled = os.getenv('VIDEO_COMPRESSION_ENABLED', 'true').lower() == 'true'
+                if compression_enabled:
+                    compressed_path = self.compress_video_for_upload(temp_output, output_path)
+                    
+                    # Remover arquivo temporário
+                    if os.path.exists(temp_output):
+                        os.remove(temp_output)
+                    
+                    if compressed_path and os.path.exists(compressed_path):
+                        final_size = os.path.getsize(compressed_path) / (1024*1024)
+                        print(f"✅ [{self.camera_name}] Arquivo final comprimido: {final_size:.1f} MB")
+                        return True
+                    else:
+                        print(f"❌ [{self.camera_name}] Falha na compressão")
+                        return False
+                else:
+                    # Apenas renomear arquivo temporário
+                    os.rename(temp_output, output_path)
+                    print(f"✅ [{self.camera_name}] Arquivo salvo sem compressão: {temp_size:.1f} MB")
+                    return True
+            else:
+                print(f"❌ [{self.camera_name}] Arquivo temporário não foi criado")
+                return False
+            
+        except Exception as e:
+            print(f"❌ [{self.camera_name}] Erro durante salvamento: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
+        finally:
+            # Reativar verificações após salvamento
+            self.saving = False
+            print(f"🔓 [{self.camera_name}] Flag saving desativada")
+
+class CameraSystem:
+    def __init__(self):
+        self.cameras = {}
+        self.running = False
+        
+        # Inicializar Device Manager e QR Generator
+        print("🔧 Inicializando sistema de identificação do dispositivo...")
+        self.device_manager = DeviceManager()
+        self.qr_generator = QRCodeGenerator(device_manager=self.device_manager)
+        
+        # Inicializar ONVIF Device Manager
+        print("📡 Inicializando sistema ONVIF para câmeras...")
+        self.onvif_manager = ONVIFDeviceManager()
+        
+        # Inicializar Supabase Manager
+        print("☁️ Inicializando gerenciador do Supabase...")
+        self.supabase_manager = SupabaseManager(device_manager=self.device_manager)
+        
+        # Obter Device ID único
+        self.device_id = self.device_manager.get_device_id()
+        print(f"🆔 Device ID do sistema: {self.device_id}")
+        
+        # Gerar QR Code do Device ID
+        self._initialize_qr_code()
+        
+        # Carregar configurações
+        self.load_config()
+        
+    def _initialize_qr_code(self):
+        """Inicializa e gera o QR Code do Device ID"""
+        try:
+            print("🔳 Verificando QR Code do dispositivo...")
+            
+            # Verificar se já existe um QR code válido
+            qr_status = self.qr_generator.verificar_qr_existente()
+            
+            if qr_status.get('exists') and qr_status.get('valid'):
+                print(f"✅ QR Code existente encontrado:")
+                print(f"   📱 PNG: {qr_status['png_file'].name}")
+                print(f"   📄 Base64: {qr_status['base64_file'].name}")
+            else:
+                print("🔳 Gerando novo QR Code do Device ID...")
+                qr_result = self.qr_generator.generate_device_qr_code()
+                
+                if 'error' not in qr_result:
+                    print(f"✅ QR Code gerado com sucesso!")
+                    print(f"   📱 PNG: {qr_result['files']['png_image']}")
+                    print(f"   📄 Base64: {qr_result['files']['base64_file']}")
+                    print(f"   📋 Info: {qr_result['files']['info_file']}")
+                else:
+                    print(f"❌ Erro ao gerar QR Code: {qr_result['error']}")
+                    
+        except Exception as e:
+            print(f"❌ Erro na inicialização do QR Code: {e}")
+            import traceback
+            traceback.print_exc()
+        
+    def load_config(self):
+        """Carrega as configurações do arquivo config.env"""
+        # Busca o config.env na pasta pai (raiz do projeto)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(os.path.dirname(current_dir), "config.env")
+        
+        # Se não encontrar na pasta pai, tenta na pasta atual
+        if not os.path.exists(config_path):
+            config_path = os.path.join(current_dir, "config.env")
+            
+        if not os.path.exists(config_path):
+            print(f"❌ Arquivo config.env não encontrado!")
+            print(f"   Procurado em: {config_path}")
+            print(f"   Certifique-se que o arquivo config.env está na raiz do projeto")
+            return False
+            
+        print(f"📋 Carregando configurações de: {config_path}")
+            
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    
+                    # Ignora linhas vazias e comentários
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    # Verifica se a linha tem o formato correto
+                    if '=' not in line:
+                        print(f"⚠️  Linha {line_num} ignorada (formato inválido): {line}")
+                        continue
+                    
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Remove aspas se existirem
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    
+                    if key.startswith('IP_CAMERA_'):
+                        camera_id = key.replace('IP_CAMERA_', '').lower()
+                        camera_name = f"Camera_{camera_id}"
+                        
+                        print(f"📹 Encontrada câmera: {camera_name} -> {value}")
+                        
+                        self.cameras[camera_name] = CameraRecorder(
+                            camera_url=value,
+                            camera_name=camera_name
+                        )
+                        
+        except Exception as e:
+            print(f"❌ Erro ao ler config.env: {e}")
+            return False
+        
+        print(f"Carregadas {len(self.cameras)} câmeras:")
+        for name in self.cameras.keys():
+            print(f"  - {name}")
+        
+        return True
+    
+    def _sanitizar_nome_pasta(self, nome):
+        """
+        Sanitiza nomes de pastas removendo caracteres especiais e espaços
+        
+        Args:
+            nome (str): Nome original da pasta
+            
+        Returns:
+            str: Nome sanitizado com underscores no lugar de espaços
+        """
+        import re
+        
+        if not nome:
+            return "pasta_sem_nome"
+        
+        # Converter para string se não for
+        nome = str(nome)
+        
+        # Remover caracteres especiais e manter apenas letras, números, espaços e alguns símbolos
+        nome_limpo = re.sub(r'[^\w\s\-_.]', '', nome)
+        
+        # Substituir múltiplos espaços por um único espaço
+        nome_limpo = re.sub(r'\s+', ' ', nome_limpo)
+        
+        # Remover espaços no início e fim
+        nome_limpo = nome_limpo.strip()
+        
+        # Substituir espaços por underscores
+        nome_limpo = nome_limpo.replace(' ', '_')
+        
+        # Remover múltiplos underscores consecutivos
+        nome_limpo = re.sub(r'_+', '_', nome_limpo)
+        
+        # Remover underscores no início e fim
+        nome_limpo = nome_limpo.strip('_')
+        
+        # Se ficou vazio, usar nome padrão
+        if not nome_limpo:
+            nome_limpo = "pasta_sem_nome"
+        
+        return nome_limpo
+    
+    def get_device_id(self):
+        """Retorna o Device ID único do sistema"""
+        return self.device_id
+    
+    def get_device_info(self):
+        """Retorna informações completas do dispositivo"""
+        return self.device_manager.get_device_info()
+    
+    def regenerate_qr_code(self):
+        """Regenera o QR Code do Device ID"""
+        try:
+            print("🔳 Regenerando QR Code do Device ID...")
+            qr_result = self.qr_generator.generate_device_qr_code()
+            
+            if 'error' not in qr_result:
+                print(f"✅ QR Code regenerado com sucesso!")
+                print(f"   📱 PNG: {qr_result['files']['png_image']}")
+                print(f"   📄 Base64: {qr_result['files']['base64_file']}")
+                print(f"   📋 Info: {qr_result['files']['info_file']}")
+                return qr_result
+            else:
+                print(f"❌ Erro ao regenerar QR Code: {qr_result['error']}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Erro na regeneração do QR Code: {e}")
+            return None
+    
+    def list_qr_codes(self):
+        """Lista todos os QR codes gerados"""
+        return self.qr_generator.list_generated_qr_codes()
+    
+    def get_onvif_info(self, force_recreate=False):
+        """Obtém informações ONVIF das câmeras"""
+        try:
+            print("📡 Obtendo informações ONVIF das câmeras...")
+            return self.onvif_manager.obter_informacoes_cameras(force_recreate=force_recreate)
+        except Exception as e:
+            print(f"❌ Erro ao obter informações ONVIF: {e}")
+            return None
+    
+    def scan_onvif_cameras(self):
+        """Força um novo scan das câmeras ONVIF"""
+        try:
+            print("🔄 Executando novo scan ONVIF das câmeras...")
+            return self.onvif_manager.obter_informacoes_cameras(force_recreate=True)
+        except Exception as e:
+            print(f"❌ Erro no scan ONVIF: {e}")
+            return None
+    
+    def display_onvif_summary(self):
+        """Exibe um resumo das informações ONVIF"""
+        try:
+            onvif_info = self.get_onvif_info()
+            if not onvif_info:
+                print("❌ Nenhuma informação ONVIF disponível")
+                return
+            
+            print("\n📡 === RESUMO INFORMAÇÕES ONVIF ===")
+            print("-" * 50)
+            
+            for camera_key, info in onvif_info.items():
+                status = "✅ CONECTADA" if info['conexao']['status'] == 'conectado' else "❌ FALHA"
+                device_id = info['dispositivo'].get('serial_number', 'N/A')
+                device_uuid = info['dispositivo'].get('device_uuid', 'N/A')
+                modelo = info['dispositivo'].get('modelo', 'N/A')
+                fabricante = info['dispositivo'].get('fabricante', 'N/A')
+                ip = info['configuracao'].get('ip', 'N/A')
+                
+                print(f"{camera_key.upper()}: {status}")
+                print(f"   🌐 IP: {ip}")
+                print(f"   🏭 Fabricante: {fabricante}")
+                print(f"   📱 Modelo: {modelo}")
+                print(f"   🔢 Serial: {device_id}")
+                print(f"   🆔 UUID: {device_uuid}")
+                print()
+                
+        except Exception as e:
+            print(f"❌ Erro ao exibir resumo ONVIF: {e}")
+    
+    def create_save_path(self, camera_name):
+        """Cria o caminho de salvamento com hierarquia de pastas"""
+        now = datetime.now()
+        
+        # Caminho base na raiz do projeto (pasta pai da src)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        
+        # Hierarquia: arena_central_da_leste/quadra_da_leeste/2025/07-July/28/10h/
+        base_path = os.path.join(project_root, "arena_central_da_leste", "quadra_da_leeste")
+        year = now.strftime("%Y")
+        month = now.strftime("%m-%B")
+        day = now.strftime("%d")
+        hour = now.strftime("%Hh")
+        
+        # Nome do arquivo com timestamp
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        filename = f"{camera_name}_{timestamp}.mp4"
+        
+        full_path = os.path.join(base_path, year, month, day, hour, filename)
+        return full_path
+    
+    def start_system(self):
+        """Inicia o sistema de câmeras"""
+        print("Iniciando sistema de câmeras...")
+        
+        # Iniciar todas as câmeras
+        for camera in self.cameras.values():
+            if not camera.start_capture():
+                print(f"Falha ao iniciar {camera.camera_name}")
+                return False
+        
+        self.running = True
+        print("\n" + "="*50)
+        print("SISTEMA DE GRAVAÇÃO ATIVO")
+        print("Pressione 'S' para salvar os últimos 25 segundos")
+        print("Pressione 'Q' para sair")
+        print("="*50)
+        
+        return True
+    
+    def stop_system(self):
+        """Para o sistema de câmeras"""
+        print("\nParando sistema de câmeras...")
+        self.running = False
+        
+        for camera in self.cameras.values():
+            camera.stop_capture()
+        
+        print("Sistema parado.")
+    
+    def save_all_cameras(self):
+        """Salva os últimos 25 segundos de todas as câmeras e faz upload para Supabase"""
+        print("\n📹 SALVANDO E ENVIANDO ÚLTIMOS 25 SEGUNDOS...")
+        
+        # Usar timestamp único para todas as câmeras
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        
+        saved_files = []
+        failed_cameras = []
+        upload_results = []
+        
+        # ETAPA 1: Validação OBRIGATÓRIA de arena/quadra
+        arena_nome = None
+        quadra_nome = None
+        upload_enabled = False
+        
+        try:
+            # Buscar nomes reais da arena/quadra
+            names_result = self.supabase_manager.get_arena_quadra_names()
+            
+            if names_result['success']:
+                # Sanitizar nomes para remover espaços e caracteres especiais
+                arena_nome = self._sanitizar_nome_pasta(names_result['arena_nome'])
+                quadra_nome = self._sanitizar_nome_pasta(names_result['quadra_nome'])
+                upload_enabled = True
+                print(f"✅ Associação validada: {arena_nome} / {quadra_nome}")
+            else:
+                # VALIDAÇÃO OBRIGATÓRIA: Não salvar se não há arena/quadra válida
+                print(f"❌ SALVAMENTO BLOQUEADO: Dispositivo não associado a arena/quadra válida")
+                print(f"📋 Motivo: {names_result.get('message', 'Associação não encontrada')}")
+                print(f"🚫 Nenhum vídeo será salvo até que o dispositivo seja associado corretamente")
+                return
+                
+        except Exception as e:
+            # VALIDAÇÃO OBRIGATÓRIA: Não salvar em caso de erro na validação
+            print(f"❌ SALVAMENTO BLOQUEADO: Erro na validação da hierarquia")
+            print(f"📋 Erro: {e}")
+            print(f"🚫 Nenhum vídeo será salvo até que a conexão seja restabelecida")
+            return
+        
+        # ETAPA 2: Salvamento e upload por câmera
+        camera_list = list(self.cameras.items())
+        
+        for i, (camera_name, camera) in enumerate(camera_list):
+            print(f"\n🎬 Processando {camera_name} ({i+1}/{len(camera_list)})...")
+            
+            try:
+                # Criar caminho com nomes reais
+                base_path = self.create_save_path_with_names(camera.camera_name, timestamp, arena_nome, quadra_nome)
+                output_path = base_path.replace('.mp4', '_WEB.mp4')
+                
+                print(f"📁 Salvando localmente: {arena_nome}/{quadra_nome}/{now.strftime('%Y/%m-%B/%d/%Hh')}/")
+                
+                # Salvamento local
+                save_start_time = time.time()
+                if camera.save_last_25_seconds(output_path):
+                    save_duration = time.time() - save_start_time
+                    file_size = os.path.getsize(output_path) / (1024*1024) if os.path.exists(output_path) else 0
+                    
+                    print(f"💾 {camera_name}: Local salvo ({file_size:.1f} MB)", end="")
+                    saved_files.append(output_path)
+                    
+                    # Upload para bucket (se habilitado)
+                    if upload_enabled:
+                        try:
+                            # Criar caminho no bucket
+                            bucket_path = self.create_bucket_path(camera.camera_name, timestamp, arena_nome, quadra_nome)
+                            
+                            # Upload
+                            upload_start = time.time()
+                            upload_result = self.supabase_manager.upload_video_to_bucket(
+                                output_path, 
+                                bucket_path,
+                                timeout_seconds=int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '300'))
+                            )
+                            
+                            if upload_result['success']:
+                                upload_time = upload_result['upload_time']
+                                print(f" → ☁️ Upload ({upload_time:.1f}s)", end="")
+                                
+                                # Verificação imediata
+                                verify_result = self.supabase_manager.verify_upload_success(
+                                    bucket_path, 
+                                    expected_size=int(file_size * 1024 * 1024)
+                                )
+                                
+                                if verify_result['success']:
+                                    print(f" → ✅ Verificado")
+                                    upload_results.append({
+                                        'camera': camera_name,
+                                        'success': True,
+                                        'local_path': output_path,
+                                        'bucket_path': bucket_path,
+                                        'upload_time': upload_time,
+                                        'file_size': file_size
+                                    })
+                                else:
+                                    print(f" → ⚠️ Verificação falhou")
+                                    upload_results.append({
+                                        'camera': camera_name,
+                                        'success': False,
+                                        'error': verify_result['message']
+                                    })
+                            else:
+                                print(f" → ❌ Upload falhou: {upload_result['message']}")
+                                upload_results.append({
+                                    'camera': camera_name,
+                                    'success': False,
+                                    'error': upload_result['message']
+                                })
+                                
+                        except Exception as upload_error:
+                            print(f" → ❌ Erro no upload: {upload_error}")
+                            upload_results.append({
+                                'camera': camera_name,
+                                'success': False,
+                                'error': str(upload_error)
+                            })
+                    else:
+                        print(f" - SEM UPLOAD")
+                        upload_results.append({
+                            'camera': camera_name,
+                            'success': False,
+                            'error': 'Upload não autorizado - dispositivo não associado'
+                        })
+                        
+                else:
+                    save_duration = time.time() - save_start_time
+                    print(f"❌ Falha no salvamento local para {camera_name} após {save_duration:.1f}s")
+                    failed_cameras.append(camera_name)
+                
+                # Delay entre câmeras
+                if i < len(camera_list) - 1:
+                    print(f"⏳ Aguardando 2s antes da próxima câmera...")
+                    time.sleep(2)
+                    
+            except Exception as e:
+                print(f"❌ Erro geral ao processar {camera_name}: {e}")
+                failed_cameras.append(camera_name)
+        
+        # ETAPA 3: Relatório final consolidado
+        print(f"\n📊 RELATÓRIO FINAL:")
+        
+        if saved_files:
+            successful_uploads = [r for r in upload_results if r['success']]
+            failed_uploads = [r for r in upload_results if not r['success']]
+            
+            if upload_enabled:
+                print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} vídeos salvos localmente e {len(successful_uploads)}/{len(saved_files)} enviados para bucket")
+                
+                if successful_uploads:
+                    total_upload_time = sum(r.get('upload_time', 0) for r in successful_uploads)
+                    total_size = sum(r.get('file_size', 0) for r in successful_uploads)
+                    print(f"⏱️ Tempo total de upload: {total_upload_time:.1f}s")
+                    print(f"📦 Tamanho total enviado: {total_size:.1f} MB")
+                
+                if failed_uploads:
+                    print(f"❌ Falhas no upload:")
+                    for result in failed_uploads:
+                        print(f"   • {result['camera']}: {result['error']}")
+            else:
+                print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} localmente - Upload não autorizado")
+        
+        if failed_cameras:
+            print(f"\n❌ Falha ao salvar câmeras: {', '.join(failed_cameras)}")
+            
+        if not saved_files and not failed_cameras:
+            print("❌ Nenhum arquivo foi salvo.")
+
+    def create_save_path_with_names(self, camera_name, timestamp, arena_nome, quadra_nome):
+        """Cria o caminho de salvamento com nomes reais da arena/quadra"""
+        now = datetime.now()
+        
+        # Caminho base na raiz do projeto
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        
+        # Hierarquia com nomes reais
+        base_path = os.path.join(project_root, arena_nome, quadra_nome)
+        year = now.strftime("%Y")
+        month = now.strftime("%m-%B")
+        day = now.strftime("%d")
+        hour = now.strftime("%Hh")
+        
+        # Nome do arquivo com timestamp fornecido
+        filename = f"{camera_name}_{timestamp}.mp4"
+        
+        full_path = os.path.join(base_path, year, month, day, hour, filename)
+        return full_path
+
+    def create_bucket_path(self, camera_name, timestamp, arena_nome, quadra_nome):
+        """Cria o caminho no bucket com estrutura hierárquica"""
+        now = datetime.now()
+        
+        # Estrutura hierárquica no bucket
+        year = now.strftime("%Y")
+        month = now.strftime("%m-%B")
+        day = now.strftime("%d")
+        hour = now.strftime("%Hh")
+        
+        # Nome do arquivo
+        filename = f"{camera_name}_{timestamp}_WEB.mp4"
+        
+        # Caminho completo no bucket
+        bucket_path = f"{arena_nome}/{quadra_nome}/{year}/{month}/{day}/{hour}/{filename}"
+        return bucket_path
+    
+    def create_save_path_with_timestamp(self, camera_name, timestamp):
+        """Cria o caminho de salvamento com timestamp específico"""
+        now = datetime.now()
+        
+        # Caminho base na raiz do projeto (pasta pai da src)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        
+        # Hierarquia: arena_central_da_leste/quadra_da_leeste/2025/07-July/28/10h/
+        base_path = os.path.join(project_root, "arena_central_da_leste", "quadra_da_leeste")
+        year = now.strftime("%Y")
+        month = now.strftime("%m-%B")
+        day = now.strftime("%d")
+        hour = now.strftime("%Hh")
+        
+        # Nome do arquivo com timestamp fornecido
+        filename = f"{camera_name}_{timestamp}.mp4"
+        
+        full_path = os.path.join(base_path, year, month, day, hour, filename)
+        return full_path
+    
+    def run(self):
+        """Executa o loop principal do sistema"""
+        # Sistema já foi iniciado na main(), apenas executar o loop
+        try:
+            while self.running:
+                # Exibir frames de todas as câmeras
+                for name, camera in self.cameras.items():
+                    frame = camera.get_latest_frame()
+                    if frame is not None:
+                        # Redimensionar para exibição (opcional)
+                        display_frame = cv2.resize(frame, (960, 540))
+                        cv2.imshow(name, display_frame)
+
+                # Verificar teclas pressionadas (1ms de delay)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord('s'):
+                    self.save_all_cameras()
+                
+                elif key == ord('q'):
+                    break
+
+                # Fechar janelas se o 'X' for clicado
+                if len(self.cameras) > 0:
+                    first_camera = list(self.cameras.keys())[0]
+                    if cv2.getWindowProperty(first_camera, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+
+        except KeyboardInterrupt:
+            print("\nInterrompido pelo usuário")
+        
+        finally:
+            self.stop_system()
+            cv2.destroyAllWindows()
+    
+    def _display_device_info(self):
+        """Exibe informações do Device ID e QR Code"""
+        print("\n" + "="*60)
+        print("📋 INFORMAÇÕES DO DISPOSITIVO")
+        print("="*60)
+        print(f"🆔 Device ID: {self.device_id}")
+        
+        device_info = self.get_device_info()
+        if device_info and 'error' not in device_info:
+            print(f"💻 Sistema: {device_info.get('system', 'N/A')}")
+            print(f"🏠 Hostname: {device_info.get('hostname', 'N/A')}")
+            print(f"🏗️  Arquitetura: {device_info.get('machine', 'N/A')}")
+            print(f"📅 Criado em: {device_info.get('created_at', 'N/A')}")
+            
+            # Verificar integridade
+            integrity_ok = self.device_manager.verify_device_integrity()
+            print(f"🔒 Integridade: {'✅ OK' if integrity_ok else '❌ FALHA'}")
+        
+        # Listar QR codes disponíveis
+        qr_files = self.list_qr_codes()
+        if qr_files['png_images']:
+            print(f"\n🔳 QR Codes disponíveis: {len(qr_files['png_images'])} imagens")
+            for png_file in qr_files['png_images']:
+                file_size = png_file.stat().st_size / 1024  # KB
+                print(f"   📱 {png_file.name} ({file_size:.1f} KB)")
+        else:
+            print("\n🔳 Nenhum QR Code encontrado")
+        
+        print("="*60)
+        print("Pressione qualquer tecla para continuar...")
+        print("="*60)
+
+def main():
+    """Função principal"""
+    # Limpar cache de logs para nova execução
+    system_logger.clear_cache()
+    
+    log_info("🔧 Inicializando Sistema de Câmeras...")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    
+    try:
+        # Criar sistema
+        system = CameraSystem()
+        
+        # 1. Device Manager
+        device_id = system.get_device_id()
+        if device_id:
+            log_success(f"✅ Device Manager ({device_id[:8]}...)")
+        else:
+            log_error("❌ Device Manager - Falha ao obter Device ID")
+            return
+        
+        # 2. QR Code Generator
+        qr_files = system.list_qr_codes()
+        if qr_files['png_images']:
+            log_success(f"✅ QR Code Generator ({len(qr_files['png_images'])} códigos)")
+        else:
+            log_warning("⚠️ QR Code Generator - Nenhum código encontrado")
+        
+        # 3. ONVIF Integration
+        onvif_info = system.get_onvif_info()
+        if onvif_info:
+            camera_count = len([info for info in onvif_info.values() if 'error' not in info])
+            if camera_count > 0:
+                log_success(f"✅ ONVIF Integration ({camera_count} câmeras)")
+            else:
+                log_warning("⚠️ ONVIF Integration - Câmeras com erro")
+        else:
+            log_warning("⚠️ ONVIF Integration - Nenhuma câmera encontrada")
+        
+        # 4. Supabase Connection
+        try:
+            # Conectar sem logs verbosos
+            if system.supabase_manager.conectar_supabase():
+                log_success("✅ Supabase Connection")
+                
+                # Execução automática do Supabase (sem logs duplicados)
+                resultado = system.supabase_manager.executar_verificacao_completa()
+                
+                if resultado['success']:
+                    log_success("✅ Supabase Integration (totem e câmeras)")
+                else:
+                    log_warning(f"⚠️ Supabase Integration - {resultado['message']}")
+            else:
+                log_error("❌ Supabase Connection - Falha na conexão")
+        except Exception as e:
+            log_error(f"❌ Supabase Connection - Erro: {e}")
+        
+        # 5. Camera Buffers
+        if system.start_system():
+            camera_count = len(system.cameras)
+            log_success(f"✅ Camera Buffers ({camera_count} câmeras, 25s cada)")
+        else:
+            log_error("❌ Camera Buffers - Falha na inicialização")
+            return
+        
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        log_success("🎉 SISTEMA PRONTO!")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("💡 Controles:")
+        print("   • Pressione 'S' para salvar os últimos 25 segundos")
+        print("   • Pressione 'Q' para sair")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        # Executar sistema
+        system.run()
+        
+    except Exception as e:
+        log_error(f"Erro crítico na inicialização: {e}")
+        return
+
+if __name__ == "__main__":
+    main()
