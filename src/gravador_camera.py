@@ -847,6 +847,185 @@ class CameraSystem:
         
         print("Sistema parado.")
     
+    def _capture_synchronized_buffer(self, camera, sync_timestamp):
+        """Captura buffer sincronizado baseado no timestamp de referência"""
+        try:
+            with camera.buffer_lock:
+                if len(camera.frame_buffer) == 0 or len(camera.timestamp_buffer) == 0:
+                    return None
+                
+                frames = list(camera.frame_buffer)
+                timestamps = list(camera.timestamp_buffer)
+                
+                # Encontrar o índice mais próximo do timestamp de sincronização
+                # Queremos os frames ANTES do momento da tecla 'S'
+                sync_index = len(timestamps) - 1  # Começar do final
+                
+                for i in range(len(timestamps) - 1, -1, -1):
+                    if timestamps[i] <= sync_timestamp:
+                        sync_index = i
+                        break
+                
+                # Calcular quantos frames queremos (25 segundos)
+                target_frames = camera.fps * camera.buffer_seconds
+                
+                # Determinar o índice de início
+                start_index = max(0, sync_index - target_frames + 1)
+                end_index = sync_index + 1
+                
+                # Extrair frames e timestamps sincronizados
+                sync_frames = frames[start_index:end_index]
+                sync_timestamps = timestamps[start_index:end_index]
+                
+                if len(sync_frames) > 0:
+                    buffer_duration = sync_timestamps[-1] - sync_timestamps[0] if len(sync_timestamps) > 1 else 0
+                    print(f"🎯 {camera.camera_name}: Sincronizado em {sync_timestamp:.3f}, {len(sync_frames)} frames, {buffer_duration:.1f}s")
+                    
+                    return {
+                        'frames': sync_frames,
+                        'timestamps': sync_timestamps,
+                        'sync_timestamp': sync_timestamp,
+                        'camera_name': camera.camera_name
+                    }
+                
+                return None
+                
+        except Exception as e:
+            print(f"❌ Erro na sincronização do buffer {camera.camera_name}: {e}")
+            return None
+
+    def _save_synchronized_buffer(self, camera, sync_buffer, output_path):
+        """Salva buffer sincronizado em formato otimizado"""
+        print(f"🎬 [{camera.camera_name}] Iniciando salvamento sincronizado...")
+        
+        # Marcar que está salvando
+        camera.saving = True
+        print(f"🔒 [{camera.camera_name}] Flag saving ativada")
+        
+        try:
+            frames = sync_buffer['frames']
+            timestamps = sync_buffer['timestamps']
+            
+            # Verificar se há frames suficientes
+            min_frames = camera.fps * 5  # Pelo menos 5 segundos
+            if len(frames) < min_frames:
+                print(f"❌ [{camera.camera_name}] Buffer insuficiente: {len(frames)} frames (mínimo: {min_frames})")
+                return False
+            
+            # Calcular tempo real do buffer
+            if len(timestamps) > 1:
+                buffer_duration = timestamps[-1] - timestamps[0]
+                real_fps = len(frames) / buffer_duration if buffer_duration > 0 else 0
+                print(f"📊 [{camera.camera_name}] {len(frames)} frames, {buffer_duration:.1f}s, FPS real: {real_fps:.1f}")
+            
+            # Criar pasta se não existir
+            print(f"📁 [{camera.camera_name}] Criando diretório: {os.path.dirname(output_path)}")
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Configurar codec otimizado
+            print(f"🎥 [{camera.camera_name}] Configurando VideoWriter otimizado...")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            print(f"📐 [{camera.camera_name}] Resolução: {camera.frame_width}x{camera.frame_height}")
+            
+            # Usar FPS reduzido para arquivo menor
+            optimized_fps = int(os.getenv('VIDEO_FPS_UPLOAD', '15'))
+            
+            # Criar arquivo temporário primeiro
+            temp_output = output_path.replace('.mp4', '_temp.mp4')
+            out = cv2.VideoWriter(temp_output, fourcc, optimized_fps, 
+                                 (camera.frame_width, camera.frame_height))
+            
+            if not out.isOpened():
+                print(f"❌ [{camera.camera_name}] Erro ao criar VideoWriter")
+                return False
+            
+            print(f"✅ [{camera.camera_name}] VideoWriter otimizado configurado (MP4V, {optimized_fps} FPS)")
+            
+            # Calcular step para manter FPS desejado
+            frame_step = max(1, int(camera.fps / optimized_fps))
+            print(f"💾 [{camera.camera_name}] Salvando frames sincronizados (step: {frame_step})...")
+            
+            frames_written = 0
+            start_time = time.time()
+            
+            for i in range(0, len(frames), frame_step):
+                try:
+                    frame = frames[i]
+                    if frame is not None:
+                        # Verificar timeout (máximo 2 minutos)
+                        elapsed = time.time() - start_time
+                        if elapsed > 120:  # 2 minutos
+                            print(f"⏰ [{camera.camera_name}] Timeout após {elapsed:.1f}s - salvando {frames_written} frames")
+                            break
+                        
+                        # Aplicar marca d'água se habilitada
+                        if camera.watermark_manager:
+                            frame = camera.watermark_manager.apply_watermark(frame)
+                        
+                        out.write(frame)
+                        frames_written += 1
+                        
+                        # Progress report a cada 50 frames salvos
+                        if frames_written % 50 == 0:
+                            progress = (i / len(frames)) * 100
+                            elapsed = time.time() - start_time
+                            fps_write = frames_written / elapsed if elapsed > 0 else 0
+                            watermark_status = "com marca d'água" if camera.watermark_manager else "sem marca d'água"
+                            print(f"📈 [{camera.camera_name}] Progresso: {frames_written} frames salvos ({progress:.1f}%) - {fps_write:.1f} fps escrita ({watermark_status})")
+                    else:
+                        print(f"⚠️  [{camera.camera_name}] Frame {i} é None")
+                        
+                except Exception as e:
+                    print(f"❌ [{camera.camera_name}] Erro ao escrever frame {i}: {e}")
+                    continue
+            
+            print(f"🔚 [{camera.camera_name}] Finalizando arquivo temporário...")
+            total_time = time.time() - start_time
+            print(f"⏱️  [{camera.camera_name}] Tempo total de escrita: {total_time:.1f}s")
+            
+            out.release()
+            
+            # Verificar se o arquivo temporário foi criado
+            if os.path.exists(temp_output):
+                temp_size = os.path.getsize(temp_output) / (1024*1024)
+                print(f"📏 [{camera.camera_name}] Arquivo temporário: {temp_size:.1f} MB, Frames: {frames_written}")
+                
+                # Comprimir para upload se habilitado
+                compression_enabled = os.getenv('VIDEO_COMPRESSION_ENABLED', 'true').lower() == 'true'
+                if compression_enabled:
+                    compressed_path = camera.compress_video_for_upload(temp_output, output_path)
+                    
+                    # Remover arquivo temporário
+                    if os.path.exists(temp_output):
+                        os.remove(temp_output)
+                    
+                    if compressed_path and os.path.exists(compressed_path):
+                        final_size = os.path.getsize(compressed_path) / (1024*1024)
+                        print(f"✅ [{camera.camera_name}] Arquivo final comprimido: {final_size:.1f} MB")
+                        return True
+                    else:
+                        print(f"❌ [{camera.camera_name}] Falha na compressão")
+                        return False
+                else:
+                    # Apenas renomear arquivo temporário
+                    os.rename(temp_output, output_path)
+                    print(f"✅ [{camera.camera_name}] Arquivo salvo sem compressão: {temp_size:.1f} MB")
+                    return True
+            else:
+                print(f"❌ [{camera.camera_name}] Arquivo temporário não foi criado")
+                return False
+            
+        except Exception as e:
+            print(f"❌ [{camera.camera_name}] Erro durante salvamento sincronizado: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
+        finally:
+            # Reativar verificações após salvamento
+            camera.saving = False
+            print(f"🔓 [{camera.camera_name}] Flag saving desativada")
+
     def save_all_cameras(self):
         """Salva os últimos 25 segundos de todas as câmeras e faz upload para Supabase"""
         print("\n📹 SALVANDO E ENVIANDO ÚLTIMOS 25 SEGUNDOS...")
@@ -858,9 +1037,33 @@ class CameraSystem:
             if self.replay_manager is None:
                 print("❌ Falha na inicialização do ReplayManager. Continuando sem registro de replays.")
         
-        # Usar timestamp único para todas as câmeras
+        # SINCRONIZAÇÃO CRÍTICA: Capturar timestamp exato no momento da tecla 'S'
+        sync_timestamp = time.time()
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
+        
+        print(f"🕐 Timestamp de sincronização: {sync_timestamp:.3f}")
+        print(f"📅 Horário de referência: {now.strftime('%H:%M:%S.%f')[:-3]}")
+        
+        # ETAPA 0: Sincronizar buffers de todas as câmeras SIMULTANEAMENTE
+        print("🔄 Sincronizando buffers de todas as câmeras...")
+        synchronized_buffers = {}
+        
+        for camera_name, camera in self.cameras.items():
+            try:
+                # Capturar buffer com timestamp de referência
+                sync_buffer = self._capture_synchronized_buffer(camera, sync_timestamp)
+                if sync_buffer:
+                    synchronized_buffers[camera_name] = sync_buffer
+                    print(f"✅ {camera_name}: Buffer sincronizado ({len(sync_buffer['frames'])} frames)")
+                else:
+                    print(f"❌ {camera_name}: Falha na sincronização do buffer")
+            except Exception as e:
+                print(f"❌ {camera_name}: Erro na sincronização - {e}")
+        
+        if not synchronized_buffers:
+            print("❌ Nenhuma câmera foi sincronizada. Abortando salvamento.")
+            return
         
         saved_files = []
         failed_cameras = []
@@ -895,171 +1098,207 @@ class CameraSystem:
             print(f"🚫 Nenhum vídeo será salvo até que a conexão seja restabelecida")
             return
         
-        # ETAPA 2: Salvamento e upload por câmera
-        camera_list = list(self.cameras.items())
+        # ETAPA 2: Salvamento e upload por câmera usando buffers sincronizados
+        # OTIMIZAÇÃO: Processar câmeras em paralelo para melhor performance
+        print(f"🚀 Iniciando processamento paralelo de {len(synchronized_buffers)} câmeras...")
         
-        for i, (camera_name, camera) in enumerate(camera_list):
-            print(f"\n🎬 Processando {camera_name} ({i+1}/{len(camera_list)})...")
+        import concurrent.futures
+        
+        def process_camera_sync(camera_name_and_buffer):
+            camera_name, sync_buffer = camera_name_and_buffer
+            camera = self.cameras[camera_name]
             
             try:
                 # Criar caminho com nomes reais
                 base_path = self.create_save_path_with_names(camera.camera_name, timestamp, arena_nome, quadra_nome)
                 output_path = base_path.replace('.mp4', '_WEB.mp4')
                 
-                print(f"📁 Salvando localmente: {arena_nome}/{quadra_nome}/{now.strftime('%Y/%m-%B/%d/%Hh')}/")
+                print(f"📁 [{camera_name}] Salvando localmente: {arena_nome}/{quadra_nome}/{now.strftime('%Y/%m-%B/%d/%Hh')}/")
                 
-                # Salvamento local
+                # Salvamento local usando buffer sincronizado
                 save_start_time = time.time()
-                if camera.save_last_25_seconds(output_path):
+                if self._save_synchronized_buffer(camera, sync_buffer, output_path):
                     save_duration = time.time() - save_start_time
                     file_size = os.path.getsize(output_path) / (1024*1024) if os.path.exists(output_path) else 0
                     
-                    print(f"💾 {camera_name}: Local salvo ({file_size:.1f} MB)", end="")
-                    saved_files.append(output_path)
+                    return {
+                        'camera_name': camera_name,
+                        'success': True,
+                        'output_path': output_path,
+                        'file_size': file_size,
+                        'save_duration': save_duration
+                    }
+                else:
+                    return {
+                        'camera_name': camera_name,
+                        'success': False,
+                        'error': 'Falha no salvamento local'
+                    }
                     
-                    # Upload para bucket (se habilitado)
-                    if upload_enabled:
-                        try:
-                            # Criar caminho no bucket
-                            bucket_path = self.create_bucket_path(camera.camera_name, timestamp, arena_nome, quadra_nome)
+            except Exception as e:
+                return {
+                    'camera_name': camera_name,
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        # Executar processamento paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(synchronized_buffers)) as executor:
+            # Submeter todas as tarefas
+            future_to_camera = {
+                executor.submit(process_camera_sync, item): item[0] 
+                for item in synchronized_buffers.items()
+            }
+            
+            # Coletar resultados conforme completam
+            save_results = []
+            for future in concurrent.futures.as_completed(future_to_camera):
+                camera_name = future_to_camera[future]
+                try:
+                    result = future.result()
+                    save_results.append(result)
+                    
+                    if result['success']:
+                        print(f"✅ {result['camera_name']}: Salvamento concluído ({result['file_size']:.1f} MB em {result['save_duration']:.1f}s)")
+                        saved_files.append(result['output_path'])
+                    else:
+                        print(f"❌ {result['camera_name']}: {result['error']}")
+                        failed_cameras.append(result['camera_name'])
+                        
+                except Exception as exc:
+                    print(f"❌ {camera_name}: Exceção durante processamento - {exc}")
+                    failed_cameras.append(camera_name)
+        
+        print(f"🏁 Processamento paralelo concluído: {len(saved_files)} sucessos, {len(failed_cameras)} falhas")
+        
+        # ETAPA 3: Upload sequencial (para evitar sobrecarga do Supabase)
+        if saved_files and upload_enabled:
+            print(f"\n☁️ Iniciando uploads sequenciais para {len(saved_files)} arquivos...")
+            
+            for i, output_path in enumerate(saved_files):
+                # Encontrar o resultado correspondente
+                camera_result = next((r for r in save_results if r.get('output_path') == output_path), None)
+                if not camera_result:
+                    continue
+                    
+                camera_name = camera_result['camera_name']
+                camera = self.cameras[camera_name]
+                file_size = camera_result['file_size']
+                
+                print(f"\n☁️ Upload {i+1}/{len(saved_files)}: {camera_name}")
+                
+                try:
+                    # Criar caminho no bucket
+                    bucket_path = self.create_bucket_path(camera.camera_name, timestamp, arena_nome, quadra_nome)
+                    
+                    # Upload
+                    upload_start = time.time()
+                    upload_result = self.supabase_manager.upload_video_to_bucket(
+                        output_path, 
+                        bucket_path,
+                        timeout_seconds=int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '300'))
+                    )
+                    
+                    if upload_result['success']:
+                        upload_time = upload_result['upload_time']
+                        print(f"   ✅ Upload concluído em {upload_time:.1f}s")
+                        
+                        # Verificação imediata
+                        verify_result = self.supabase_manager.verify_upload_success(
+                            bucket_path, 
+                            expected_size=int(file_size * 1024 * 1024)
+                        )
+                        
+                        if verify_result['success']:
+                            print(f"   ✅ Verificação bem-sucedida")
                             
-                            # Upload
-                            upload_start = time.time()
-                            upload_result = self.supabase_manager.upload_video_to_bucket(
-                                output_path, 
-                                bucket_path,
-                                timeout_seconds=int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '300'))
-                            )
-                            
-                            if upload_result['success']:
-                                upload_time = upload_result['upload_time']
-                                print(f" → ☁️ Upload ({upload_time:.1f}s)", end="")
-                                
-                                # Verificação imediata
-                                verify_result = self.supabase_manager.verify_upload_success(
-                                    bucket_path, 
-                                    expected_size=int(file_size * 1024 * 1024)
-                                )
-                                
-                                if verify_result['success']:
-                                    print(f" → ✅ Verificado")
-                                    
-                                    # INTEGRAÇÃO: Inserir registro na tabela replays
-                                    try:
-                                        # Verificar se o ReplayManager está disponível
-                                        if self.replay_manager is None:
-                                            print(f" → ⚠️ ReplayManager não disponível, pulando registro")
-                                        else:
-                                            # Obter camera_id do UUID ONVIF ou gerar baseado na ordem
-                                            camera_uuid = self._get_camera_uuid_from_name(camera_name)
-                                            
-                                            # Obter URL pública do upload
-                                            public_url = upload_result.get('public_url', '')
-                                            
-                                            # Validar se a URL é completa e funcional
-                                            if not self._validar_url_completa(public_url):
-                                                print(f" → ⚠️ URL pública inválida ou incompleta: {public_url}")
-                                                
-                                                # Tentar gerar URL assinada como alternativa
-                                                print(f" → 🔄 Tentando gerar URL assinada como alternativa...")
-                                                try:
-                                                    signed_url = self.hierarchical_video_manager._obter_url_assinada(bucket_path)
-                                                    if signed_url and self._validar_url_completa(signed_url):
-                                                        public_url = signed_url
-                                                        print(f" → ✅ URL assinada gerada com sucesso")
-                                                    else:
-                                                        print(f" → ❌ Falha ao gerar URL assinada válida")
-                                                        print(f" → ⚠️ Pulando registro replay - nenhuma URL válida disponível")
-                                                        continue  # Pula para a próxima iteração
-                                                except Exception as url_error:
-                                                    print(f" → ❌ Erro ao gerar URL assinada: {url_error}")
-                                                    print(f" → ⚠️ Pulando registro replay - nenhuma URL válida disponível")
-                                                    continue  # Pula para a próxima iteração
-                                            
-                                            # Só inserir registro se temos uma URL válida
-                                            if self._validar_url_completa(public_url):
-                                                replay_result = self.replay_manager.insert_replay_record(
-                                                    camera_id=camera_uuid,
-                                                    video_url=public_url,  # URL completa validada
-                                                    timestamp_video=datetime.now(),
-                                                    bucket_path=bucket_path
-                                                )
-                                                
-                                                if replay_result['success']:
-                                                    print(f" → 📊 Registro replay inserido com URL completa")
-                                                else:
-                                                    error_msg = replay_result.get('error', replay_result.get('message', 'Erro desconhecido'))
-                                                    print(f" → ❌ Erro no registro replay: {error_msg}")
-                                            else:
-                                                print(f" → ❌ URL final ainda inválida, não inserindo registro replay")
-                                            
-                                    except Exception as replay_error:
-                                        print(f" → ❌ Erro no registro replay: {replay_error}")
-                                        log_error(f"Exceção no registro replay para {camera_name}: {replay_error}")
-                                        # NÃO interrompe o fluxo principal
-                                    
-                                    # EXCLUSÃO AUTOMÁTICA: Excluir arquivo local após upload bem-sucedido
-                                    if self._excluir_arquivo_local_apos_upload(output_path, camera_name):
-                                        print(f" → ✅ Upload completo e arquivo local removido")
-                                    else:
-                                        print(f" → ⚠️ Upload completo mas arquivo local não foi removido")
-                                    
-                                    upload_results.append({
-                                        'camera': camera_name,
-                                        'success': True,
-                                        'local_path': output_path,
-                                        'bucket_path': bucket_path,
-                                        'upload_time': upload_time,
-                                        'file_size': file_size,
-                                        'local_file_deleted': True  # Indicar que o arquivo foi excluído
-                                    })
+                            # Registro replay (mantendo lógica existente)
+                            try:
+                                if self.replay_manager is None:
+                                    print(f"   ⚠️ ReplayManager não disponível, pulando registro")
                                 else:
-                                    print(f" → ⚠️ Verificação falhou")
-                                    upload_results.append({
-                                        'camera': camera_name,
-                                        'success': False,
-                                        'error': verify_result['message'],
-                                        'local_file_deleted': False  # Arquivo mantido devido ao erro
-                                    })
-                            else:
-                                print(f" → ❌ Upload falhou: {upload_result['message']}")
-                                upload_results.append({
-                                    'camera': camera_name,
-                                    'success': False,
-                                    'error': upload_result['message'],
-                                    'local_file_deleted': False  # Arquivo mantido devido ao erro
-                                })
+                                    camera_uuid = self._get_camera_uuid_from_name(camera_name)
+                                    public_url = upload_result.get('public_url', '')
+                                    
+                                    if not self._validar_url_completa(public_url):
+                                        print(f"   🔄 Gerando URL assinada...")
+                                        try:
+                                            signed_url = self.hierarchical_video_manager._obter_url_assinada(bucket_path)
+                                            if signed_url and self._validar_url_completa(signed_url):
+                                                public_url = signed_url
+                                                print(f"   ✅ URL assinada gerada")
+                                            else:
+                                                print(f"   ❌ Falha na URL assinada")
+                                                continue
+                                        except Exception as url_error:
+                                            print(f"   ❌ Erro na URL assinada: {url_error}")
+                                            continue
+                                    
+                                    if self._validar_url_completa(public_url):
+                                        replay_result = self.replay_manager.insert_replay_record(
+                                            camera_id=camera_uuid,
+                                            video_url=public_url,
+                                            timestamp_video=datetime.now(),
+                                            bucket_path=bucket_path
+                                        )
+                                        
+                                        if replay_result['success']:
+                                            print(f"   📊 Registro replay inserido")
+                                        else:
+                                            print(f"   ❌ Erro no registro replay: {replay_result.get('error', 'Erro desconhecido')}")
+                                            
+                            except Exception as replay_error:
+                                print(f"   ❌ Erro no registro replay: {replay_error}")
+                            
+                            # Exclusão do arquivo local
+                            if self._excluir_arquivo_local_apos_upload(output_path, camera_name):
+                                print(f"   🗑️ Arquivo local removido")
                                 
-                        except Exception as upload_error:
-                            print(f" → ❌ Erro no upload: {upload_error}")
+                            upload_results.append({
+                                'camera': camera_name,
+                                'success': True,
+                                'local_path': output_path,
+                                'bucket_path': bucket_path,
+                                'upload_time': upload_time,
+                                'file_size': file_size,
+                                'local_file_deleted': True
+                            })
+                        else:
+                            print(f"   ⚠️ Verificação falhou: {verify_result['message']}")
                             upload_results.append({
                                 'camera': camera_name,
                                 'success': False,
-                                'error': str(upload_error),
-                                'local_file_deleted': False  # Arquivo mantido devido ao erro
+                                'error': verify_result['message'],
+                                'local_file_deleted': False
                             })
                     else:
-                        print(f" - SEM UPLOAD")
+                        print(f"   ❌ Upload falhou: {upload_result['message']}")
                         upload_results.append({
                             'camera': camera_name,
                             'success': False,
-                            'error': 'Upload não autorizado - dispositivo não associado',
-                            'local_file_deleted': False  # Arquivo mantido - upload não autorizado
+                            'error': upload_result['message'],
+                            'local_file_deleted': False
                         })
                         
-                else:
-                    save_duration = time.time() - save_start_time
-                    print(f"❌ Falha no salvamento local para {camera_name} após {save_duration:.1f}s")
-                    failed_cameras.append(camera_name)
-                
-                # Delay entre câmeras
-                if i < len(camera_list) - 1:
-                    print(f"⏳ Aguardando 2s antes da próxima câmera...")
-                    time.sleep(2)
-                    
-            except Exception as e:
-                print(f"❌ Erro geral ao processar {camera_name}: {e}")
-                failed_cameras.append(camera_name)
+                except Exception as upload_error:
+                    print(f"   ❌ Erro no upload: {upload_error}")
+                    upload_results.append({
+                        'camera': camera_name,
+                        'success': False,
+                        'error': str(upload_error),
+                        'local_file_deleted': False
+                    })
+        else:
+            # Sem upload - criar resultados vazios
+            upload_results = []
+            for result in save_results:
+                if result['success']:
+                    upload_results.append({
+                        'camera': result['camera_name'],
+                        'success': False,
+                        'error': 'Upload não autorizado - dispositivo não associado',
+                        'local_file_deleted': False
+                    })
         
         # ETAPA 3: Relatório final consolidado
         print(f"\n📊 RELATÓRIO FINAL:")
