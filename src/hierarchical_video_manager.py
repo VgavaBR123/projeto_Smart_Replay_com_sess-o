@@ -30,8 +30,8 @@ class HierarchicalVideoManager:
         if device_manager:
             self.device_manager = device_manager
         else:
-            src_dir = Path(__file__).parent
-            self.device_manager = DeviceManager(src_dir / "device_config")
+            # Usa DeviceManager com configuração padrão (device_config na raiz)
+            self.device_manager = DeviceManager()
         
         # Supabase Manager
         self.supabase_manager = SupabaseManager(self.device_manager)
@@ -323,34 +323,91 @@ class HierarchicalVideoManager:
         except Exception as e:
             return {'success': False, 'error': f'Erro ao salvar vídeo local: {e}'}
     
-    def _obter_url_assinada(self, bucket_path, expiracao_segundos=604800):
+    def _obter_url_assinada(self, bucket_path, expiracao_segundos=604800, max_tentativas=3):
         """
-        Obtém URL assinada para arquivo no bucket.
+        Obtém URL assinada para arquivo no bucket com retry.
         
         Args:
             bucket_path (str): Caminho do arquivo no bucket
             expiracao_segundos (int): Tempo de expiração em segundos (padrão: 7 dias)
+            max_tentativas (int): Número máximo de tentativas
         
         Returns:
-            str: URL assinada ou None se falhar
+            str: URL assinada completa ou None se falhar
         """
-        try:
-            # Gera URL assinada válida por 7 dias (604800 segundos)
-            signed_url = self.supabase.storage.from_(self.bucket_name).create_signed_url(
-                bucket_path, 
-                expiracao_segundos
-            )
-            
-            if signed_url and 'signedURL' in signed_url:
-                return signed_url['signedURL']
-            elif isinstance(signed_url, str):
-                return signed_url
-            else:
-                return None
+        import time
+        
+        for tentativa in range(max_tentativas):
+            try:
+                if not self.supabase:
+                    print(f"❌ Supabase não conectado para gerar URL assinada")
+                    return None
                 
-        except Exception as e:
-            print(f"⚠️ Erro ao gerar URL assinada: {e}")
-            return None
+                # Gera URL assinada válida por 7 dias (604800 segundos)
+                signed_url = self.supabase.storage.from_(self.bucket_name).create_signed_url(
+                    bucket_path, 
+                    expiracao_segundos
+                )
+                
+                # Verificar se a resposta contém URL válida
+                url = None
+                if signed_url and 'signedURL' in signed_url:
+                    url = signed_url['signedURL']
+                elif isinstance(signed_url, str) and signed_url.strip():
+                    url = signed_url
+                
+                # Validar se a URL é completa e funcional
+                if url and self._validar_url_completa(url):
+                    print(f"✅ URL assinada gerada (tentativa {tentativa + 1}): {Path(bucket_path).name}")
+                    return url
+                else:
+                    print(f"⚠️ URL assinada inválida na tentativa {tentativa + 1}")
+                    
+            except Exception as e:
+                print(f"⚠️ Erro ao gerar URL assinada (tentativa {tentativa + 1}): {e}")
+            
+            # Aguardar antes da próxima tentativa (exceto na última)
+            if tentativa < max_tentativas - 1:
+                delay = 1.0 * (tentativa + 1)  # 1s, 2s, 3s...
+                print(f"⏳ Aguardando {delay}s antes da próxima tentativa...")
+                time.sleep(delay)
+        
+        # Todas as tentativas falharam
+        print(f"❌ Falha ao gerar URL assinada após {max_tentativas} tentativas para: {bucket_path}")
+        return None
+    
+    def _validar_url_completa(self, url):
+        """
+        Valida se a URL é completa e funcional.
+        
+        Args:
+            url (str): URL para validar
+            
+        Returns:
+            bool: True se a URL é válida
+        """
+        if not url or not isinstance(url, str):
+            return False
+        
+        url = url.strip()
+        
+        # Verificar se começa com https://
+        if not url.startswith('https://'):
+            return False
+        
+        # Verificar se contém o domínio do Supabase
+        if 'supabase.co' not in url:
+            return False
+        
+        # Verificar se contém token
+        if '?token=' not in url:
+            return False
+        
+        # Verificar se não é uma URL de fallback
+        if url.startswith('supabase://bucket/'):
+            return False
+        
+        return True
 
     def verificar_upload_completo(self, bucket_path, expected_size=None, debug_mode=True):
         """
@@ -734,4 +791,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

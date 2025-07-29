@@ -36,6 +36,12 @@ from onvif_device_info import ONVIFDeviceManager
 # Importação para gerenciamento do Supabase
 from supabase_manager import SupabaseManager
 
+# Importação para gerenciamento de replays
+from replay_manager import ReplayManager
+
+# Importação para gerenciamento hierárquico de vídeos
+from hierarchical_video_manager import HierarchicalVideoManager
+
 # Importação para sistema de logs limpos
 from system_logger import log_info, log_success, log_warning, log_error, log_debug, system_logger
 
@@ -510,6 +516,13 @@ class CameraSystem:
         print("☁️ Inicializando gerenciador do Supabase...")
         self.supabase_manager = SupabaseManager(device_manager=self.device_manager)
         
+        # Replay Manager será inicializado após conexão com Supabase
+        self.replay_manager = None
+        
+        # Inicializar Hierarchical Video Manager
+        print("🎬 Inicializando gerenciador hierárquico de vídeos...")
+        self.hierarchical_video_manager = HierarchicalVideoManager()
+        
         # Obter Device ID único
         self.device_id = self.device_manager.get_device_id()
         print(f"🆔 Device ID do sistema: {self.device_id}")
@@ -549,6 +562,24 @@ class CameraSystem:
             import traceback
             traceback.print_exc()
         
+    def _initialize_replay_manager(self):
+        """Inicializa o ReplayManager após conexão com Supabase"""
+        try:
+            if not self.replay_manager and self.supabase_manager.supabase:
+                print("📊 Inicializando gerenciador de replays...")
+                self.replay_manager = ReplayManager(supabase_manager=self.supabase_manager)
+                log_success("ReplayManager inicializado com sucesso")
+                return True
+            elif self.replay_manager:
+                log_debug("ReplayManager já inicializado")
+                return True
+            else:
+                log_warning("Supabase não conectado - ReplayManager não inicializado")
+                return False
+        except Exception as e:
+            log_error(f"Erro ao inicializar ReplayManager: {e}")
+            return False
+    
     def load_config(self):
         """Carrega as configurações do arquivo config.env"""
         # Busca o config.env na pasta pai (raiz do projeto)
@@ -789,6 +820,13 @@ class CameraSystem:
         """Salva os últimos 25 segundos de todas as câmeras e faz upload para Supabase"""
         print("\n📹 SALVANDO E ENVIANDO ÚLTIMOS 25 SEGUNDOS...")
         
+        # Verificar se o ReplayManager está inicializado
+        if self.replay_manager is None:
+            print("⚠️ ReplayManager não inicializado. Tentando inicializar...")
+            self._initialize_replay_manager()
+            if self.replay_manager is None:
+                print("❌ Falha na inicialização do ReplayManager. Continuando sem registro de replays.")
+        
         # Usar timestamp único para todas as câmeras
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -874,6 +912,61 @@ class CameraSystem:
                                 
                                 if verify_result['success']:
                                     print(f" → ✅ Verificado")
+                                    
+                                    # INTEGRAÇÃO: Inserir registro na tabela replays
+                                    try:
+                                        # Verificar se o ReplayManager está disponível
+                                        if self.replay_manager is None:
+                                            print(f" → ⚠️ ReplayManager não disponível, pulando registro")
+                                        else:
+                                            # Obter camera_id do UUID ONVIF ou gerar baseado na ordem
+                                            camera_uuid = self._get_camera_uuid_from_name(camera_name)
+                                            
+                                            # Obter URL pública do upload
+                                            public_url = upload_result.get('public_url', '')
+                                            
+                                            # Validar se a URL é completa e funcional
+                                            if not self._validar_url_completa(public_url):
+                                                print(f" → ⚠️ URL pública inválida ou incompleta: {public_url}")
+                                                
+                                                # Tentar gerar URL assinada como alternativa
+                                                print(f" → 🔄 Tentando gerar URL assinada como alternativa...")
+                                                try:
+                                                    signed_url = self.hierarchical_video_manager._obter_url_assinada(bucket_path)
+                                                    if signed_url and self._validar_url_completa(signed_url):
+                                                        public_url = signed_url
+                                                        print(f" → ✅ URL assinada gerada com sucesso")
+                                                    else:
+                                                        print(f" → ❌ Falha ao gerar URL assinada válida")
+                                                        print(f" → ⚠️ Pulando registro replay - nenhuma URL válida disponível")
+                                                        continue  # Pula para a próxima iteração
+                                                except Exception as url_error:
+                                                    print(f" → ❌ Erro ao gerar URL assinada: {url_error}")
+                                                    print(f" → ⚠️ Pulando registro replay - nenhuma URL válida disponível")
+                                                    continue  # Pula para a próxima iteração
+                                            
+                                            # Só inserir registro se temos uma URL válida
+                                            if self._validar_url_completa(public_url):
+                                                replay_result = self.replay_manager.insert_replay_record(
+                                                    camera_id=camera_uuid,
+                                                    video_url=public_url,  # URL completa validada
+                                                    timestamp_video=datetime.now(),
+                                                    bucket_path=bucket_path
+                                                )
+                                                
+                                                if replay_result['success']:
+                                                    print(f" → 📊 Registro replay inserido com URL completa")
+                                                else:
+                                                    error_msg = replay_result.get('error', replay_result.get('message', 'Erro desconhecido'))
+                                                    print(f" → ❌ Erro no registro replay: {error_msg}")
+                                            else:
+                                                print(f" → ❌ URL final ainda inválida, não inserindo registro replay")
+                                            
+                                    except Exception as replay_error:
+                                        print(f" → ❌ Erro no registro replay: {replay_error}")
+                                        log_error(f"Exceção no registro replay para {camera_name}: {replay_error}")
+                                        # NÃO interrompe o fluxo principal
+                                    
                                     upload_results.append({
                                         'camera': camera_name,
                                         'success': True,
@@ -1081,6 +1174,127 @@ class CameraSystem:
         print("Pressione qualquer tecla para continuar...")
         print("="*60)
 
+    def _get_camera_uuid_from_name(self, camera_name):
+        """
+        Obtém UUID da câmera baseado no nome (Camera_1, Camera_2)
+        Usa dados ONVIF cadastrados na tabela cameras
+        
+        Args:
+            camera_name (str): Nome da câmera (ex: "Camera_1")
+            
+        Returns:
+            str: UUID da câmera
+        """
+        try:
+            # Tentar obter informações ONVIF primeiro
+            onvif_info = self.get_onvif_info()
+            
+            if onvif_info:
+                # Mapear nome da câmera para chave ONVIF (Camera_1 -> camera_1)
+                camera_key = camera_name.lower()  # Camera_1 -> camera_1
+                
+                log_debug(f"Buscando UUID ONVIF para {camera_name} (chave: {camera_key})")
+                
+                if camera_key in onvif_info:
+                    device_info = onvif_info[camera_key].get('dispositivo', {})
+                    device_uuid = device_info.get('device_uuid')
+                    
+                    if device_uuid and device_uuid != 'N/A':
+                        log_debug(f"UUID ONVIF encontrado para {camera_name}: {device_uuid}")
+                        return device_uuid
+                    else:
+                        log_warning(f"UUID ONVIF inválido para {camera_name}: {device_uuid}")
+                else:
+                    log_warning(f"Chave {camera_key} não encontrada no ONVIF. Chaves disponíveis: {list(onvif_info.keys())}")
+            
+            # Fallback: Buscar diretamente na tabela cameras do Supabase
+            log_info(f"Tentando buscar UUID na tabela cameras para {camera_name}")
+            
+            if self.supabase_manager and self.supabase_manager.supabase:
+                try:
+                    # Extrair número da câmera (Camera_1 -> 1)
+                    camera_number = camera_name.split('_')[-1] if '_' in camera_name else '1'
+                    
+                    # Buscar câmera por ordem na tabela
+                    response = self.supabase_manager.supabase.table('cameras').select('id, nome, ordem').eq('ordem', int(camera_number)).execute()
+                    
+                    if response.data:
+                        camera_data = response.data[0]
+                        camera_uuid = camera_data['id']
+                        log_success(f"UUID encontrado na tabela cameras para {camera_name}: {camera_uuid}")
+                        return camera_uuid
+                    else:
+                        log_warning(f"Câmera com ordem {camera_number} não encontrada na tabela")
+                        
+                except Exception as db_error:
+                    log_error(f"Erro ao buscar na tabela cameras: {db_error}")
+            
+            # Fallback final: gerar UUID determinístico (mas alertar que não será encontrado)
+            import hashlib
+            import uuid
+            
+            # Criar string única combinando device_id e nome da câmera
+            unique_string = f"{self.device_id}_{camera_name}"
+            
+            # Gerar hash MD5 da string
+            hash_object = hashlib.md5(unique_string.encode())
+            hash_hex = hash_object.hexdigest()
+            
+            # Converter hash para UUID válido
+            camera_uuid = str(uuid.UUID(hash_hex))
+            
+            log_warning(f"⚠️ UUID determinístico gerado para {camera_name}: {camera_uuid}")
+            log_warning(f"⚠️ Este UUID pode não existir na tabela cameras - registro replay pode falhar")
+            return camera_uuid
+            
+        except Exception as e:
+            log_error(f"Erro ao obter UUID da câmera {camera_name}: {e}")
+            
+            # Fallback final: UUID baseado apenas no nome
+            import hashlib
+            import uuid
+            
+            hash_object = hashlib.md5(camera_name.encode())
+            hash_hex = hash_object.hexdigest()
+            camera_uuid = str(uuid.UUID(hash_hex))
+            
+            log_error(f"❌ UUID de emergência gerado para {camera_name}: {camera_uuid}")
+            log_error(f"❌ Este UUID definitivamente não existe na tabela - registro replay falhará")
+            return camera_uuid
+
+    def _validar_url_completa(self, url):
+        """
+        Valida se a URL é completa e funcional.
+        
+        Args:
+            url (str): URL para validar
+            
+        Returns:
+            bool: True se a URL é válida
+        """
+        if not url or not isinstance(url, str):
+            return False
+        
+        url = url.strip()
+        
+        # Verificar se começa com https://
+        if not url.startswith('https://'):
+            return False
+        
+        # Verificar se contém o domínio do Supabase
+        if 'supabase.co' not in url:
+            return False
+        
+        # Verificar se contém token
+        if '?token=' not in url:
+            return False
+        
+        # Verificar se não é uma URL de fallback
+        if url.startswith('supabase://bucket/'):
+            return False
+        
+        return True
+
 def main():
     """Função principal"""
     # Limpar cache de logs para nova execução
@@ -1124,6 +1338,15 @@ def main():
             # Conectar sem logs verbosos
             if system.supabase_manager.conectar_supabase():
                 log_success("✅ Supabase Connection")
+                
+                # Conectar o hierarchical_video_manager ao Supabase também
+                if system.hierarchical_video_manager.conectar_supabase():
+                    log_success("✅ Hierarchical Video Manager Supabase Connection")
+                else:
+                    log_warning("⚠️ Hierarchical Video Manager - Falha na conexão Supabase")
+                
+                # Inicializar ReplayManager após conexão
+                system._initialize_replay_manager()
                 
                 # Execução automática do Supabase (sem logs duplicados)
                 resultado = system.supabase_manager.executar_verificacao_completa()

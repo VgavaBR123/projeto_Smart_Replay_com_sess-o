@@ -8,13 +8,18 @@ from datetime import datetime
 from system_logger import system_logger, log_debug, log_info, log_warning, log_error, log_success
 
 class DeviceManager:
-    def __init__(self, config_dir="device_config"):
+    def __init__(self, config_dir=None):
         """
         Inicializa o gerenciador de dispositivo.
         
         Args:
-            config_dir (str): Diretório onde será salvo o arquivo de configuração do dispositivo
+            config_dir (str, optional): Diretório onde será salvo o arquivo de configuração do dispositivo.
+                                      Se None, usa device_config na raiz do projeto.
         """
+        if config_dir is None:
+            # Usar pasta device_config na raiz do projeto (pasta pai da src)
+            config_dir = Path(__file__).parent.parent / "device_config"
+        
         self.config_dir = Path(config_dir)
         self.device_file = self.config_dir / "device_id.json"
         
