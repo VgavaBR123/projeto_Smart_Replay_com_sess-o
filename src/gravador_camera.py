@@ -1040,10 +1040,13 @@ class CameraSystem:
         # SINCRONIZAÇÃO CRÍTICA: Capturar timestamp exato no momento da tecla 'S'
         sync_timestamp = time.time()
         now = datetime.now()
+        # Converter timestamp da tecla 'S' para UTC para uso no banco de dados
+        key_press_timestamp_utc = datetime.fromtimestamp(sync_timestamp, tz=timezone.utc)
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         
         print(f"🕐 Timestamp de sincronização: {sync_timestamp:.3f}")
         print(f"📅 Horário de referência: {now.strftime('%H:%M:%S.%f')[:-3]}")
+        print(f"⏰ Timestamp da tecla 'S' (UTC): {key_press_timestamp_utc.strftime('%H:%M:%S.%f')[:-3]}")
         
         # ETAPA 0: Sincronizar buffers de todas as câmeras SIMULTANEAMENTE
         print("🔄 Sincronizando buffers de todas as câmeras...")
@@ -1238,7 +1241,7 @@ class CameraSystem:
                                         replay_result = self.replay_manager.insert_replay_record(
                                             camera_id=camera_uuid,
                                             video_url=public_url,
-                                            timestamp_video=datetime.now(timezone.utc),
+                                            timestamp_video=key_press_timestamp_utc,
                                             bucket_path=bucket_path
                                         )
                                         
