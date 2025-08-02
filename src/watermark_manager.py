@@ -28,7 +28,7 @@ class WatermarkManager:
         # Configurações do config.env
         self.navy_blue = (139, 69, 19)  # BGR format - azul marinho
         self.watermark_path = watermark_path or os.getenv('WATERMARK_PATH', 
-            r"c:\Users\Vinicius\PycharmProjects\Projeto_Camera_Seguranca_Otimizado\marca_dagua\Smart Byte - Horizontal.png")
+            r"c:\Users\Vinicius\PycharmProjects\Projeto Camera Vai dar Certo\marca_dagua\Smart Byte - Horizontal.png")
         self.position = os.getenv('WATERMARK_POSITION', 'bottom_right')
         self.margin = int(os.getenv('WATERMARK_MARGIN', '25'))
         self.background_padding = int(os.getenv('WATERMARK_BACKGROUND_PADDING', '8'))

@@ -7,6 +7,16 @@ Grava os últimos 25 segundos diretamente em formato otimizado quando a tecla 'S
 import os
 import sys
 import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Carregar configurações do config.env ANTES de tudo
+config_path = Path(__file__).parent.parent / "config.env"
+if config_path.exists():
+    load_dotenv(config_path)
+    print(f"📋 Configurações carregadas de: {config_path}")
+else:
+    print(f"⚠️ Arquivo config.env não encontrado em: {config_path}")
 
 # Configurações para suprimir avisos do FFmpeg/OpenCV - DEVE ser antes de importar cv2
 os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'  # Suprimir logs do FFmpeg
@@ -21,7 +31,6 @@ import time
 import queue
 from datetime import datetime, timezone
 from collections import deque
-from pathlib import Path
 
 # Configurar OpenCV para suprimir logs
 cv2.setLogLevel(0)  # Suprimir logs do OpenCV
@@ -245,7 +254,7 @@ class CameraRecorder:
             
             if watermark_enabled:
                 watermark_path = os.getenv('WATERMARK_PATH', 
-                    r"c:\Users\Vinicius\PycharmProjects\Projeto_Camera_Seguranca_Otimizado\marca_dagua\Smart Byte - Horizontal.png")
+                    r"c:\Users\Vinicius\PycharmProjects\Projeto Camera Vai dar Certo\marca_dagua\Smart Byte - Horizontal.png")
                 
                 self.watermark_manager = WatermarkManager(watermark_path)
                 print(f"🎨 [{self.camera_name}] Sistema de marca d'água inicializado")
