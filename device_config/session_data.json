@@ -1,0 +1,65 @@
+{
+  "session_id": "afb90eb5-9908-4b2b-a9a0-5aaaa6d0f98f",
+  "created_at": "2025-08-02T19:29:24.567758+00:00",
+  "expires_at": "2025-08-03T03:29:24.567758+00:00",
+  "device_info": {
+    "device_id": "8254f876-356e-5b82-96d6-a8733a149188",
+    "device_uuid": "4e58f064-6d66-5193-a6be-c5529aa336cc"
+  },
+  "totem_info": {
+    "id": "1cc4fc4a-82ff-4349-b6cb-66e9f8b7eb58",
+    "token": "8254f876-356e-5b82-96d6-a8733a149188",
+    "quadra_id": "ce64cee3-3f42-4a14-8928-e52bd7fb223b"
+  },
+  "arena_info": {
+    "id": "5533b5c6-2ca7-4e59-8357-fe04e136a868",
+    "nome": "arena gav a",
+    "nome_sanitizado": "arena_gav_a"
+  },
+  "quadra_info": {
+    "id": "ce64cee3-3f42-4a14-8928-e52bd7fb223b",
+    "nome": "eu sou um apreciador de picole",
+    "nome_sanitizado": "eu_sou_um_apreciador_de_picole"
+  },
+  "cameras": [
+    {
+      "id": null,
+      "nome": "Camera Desconhecida",
+      "ordem": 1,
+      "onvif_uuid": "4b5d3280-f2c9-5f9a-a50d-d7d67670c636",
+      "serial_number": "585B6901CEFD",
+      "ip": "192.168.101.201",
+      "totem_id": null
+    },
+    {
+      "id": null,
+      "nome": "Camera Desconhecida",
+      "ordem": 2,
+      "onvif_uuid": "4e58f064-6d66-5193-a6be-c5529aa336cc",
+      "serial_number": "585B6901CE42",
+      "ip": "192.168.101.202",
+      "totem_id": null
+    },
+    {
+      "id": null,
+      "nome": "Camera Desconhecida",
+      "ordem": 3,
+      "onvif_uuid": "N/A",
+      "serial_number": "N/A",
+      "ip": "N/A",
+      "totem_id": null
+    }
+  ],
+  "supabase_config": {
+    "url": "https://yyrozpricafmryurjihn.supabase.co",
+    "bucket_name": "videos-replay"
+  },
+  "validation_status": {
+    "all_valid": true,
+    "device_valid": true,
+    "totem_valid": true,
+    "arena_quadra_valid": true,
+    "cameras_valid": true,
+    "onvif_valid": true
+  }
+}

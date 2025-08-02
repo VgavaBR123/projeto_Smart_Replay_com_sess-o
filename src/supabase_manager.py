@@ -10,7 +10,8 @@ import os
 import uuid
 import json
 import time
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -39,6 +40,12 @@ class SupabaseManager:
         # Cliente Supabase
         self.supabase = None
         self.device_id = None
+        
+        # Conecta automaticamente ao Supabase
+        self.conectar_supabase()
+        
+        # Verifica e carrega o Device ID
+        self.verificar_device_id()
         
     def _carregar_configuracoes(self):
         """
@@ -271,11 +278,23 @@ class SupabaseManager:
             device_uuids (list): Lista de device_uuid para verificar
             
         Returns:
-            list: Lista de câmeras existentes com esses UUIDs
+            dict: Resultado da verificação com 'success' e 'cameras'
         """
+        resultado = {
+            'success': False,
+            'cameras': [],
+            'message': ''
+        }
+        
         try:
-            if not self.supabase or not device_uuids:
-                return []
+            if not self.supabase:
+                resultado['message'] = 'Supabase não conectado'
+                return resultado
+                
+            if not device_uuids:
+                resultado['success'] = True
+                resultado['message'] = 'Nenhum UUID para verificar'
+                return resultado
             
             cameras_existentes = []
             
@@ -289,11 +308,15 @@ class SupabaseManager:
                 for cam in cameras_existentes:
                     log_debug(f"Câmera {cam['nome']} - UUID: {cam['id']}")
             
-            return cameras_existentes
+            resultado['success'] = True
+            resultado['cameras'] = cameras_existentes
+            resultado['message'] = f'{len(cameras_existentes)} câmeras encontradas'
+            return resultado
                 
         except Exception as e:
             log_error(f"Erro ao verificar câmeras ONVIF existentes: {e}")
-            return []
+            resultado['message'] = f'Erro: {e}'
+            return resultado
     
     def inserir_cameras(self, totem_id):
         """
@@ -319,20 +342,20 @@ class SupabaseManager:
             if not self.supabase:
                 resultado['message'] = 'Supabase não conectado'
                 return resultado
-            
+
             log_info("Inserindo câmeras com ONVIF UUID na tabela")
             
-            # Carrega informações ONVIF das câmeras
+            # Carregar dados ONVIF
             dados_onvif = self.carregar_informacoes_onvif()
-            
+
             if not dados_onvif:
                 log_warning("Dados ONVIF não encontrados, usando inserção padrão")
                 return self._inserir_cameras_padrao(totem_id)
             
-            # Extrai device_uuid das câmeras
+            # Processar dados ONVIF
             cameras_onvif = []
             device_uuids = []
-            
+
             for camera_key, camera_data in dados_onvif.items():
                 if camera_key.startswith('camera_') and isinstance(camera_data, dict):
                     dispositivo = camera_data.get('dispositivo', {})
@@ -348,16 +371,16 @@ class SupabaseManager:
                             'modelo': dispositivo.get('modelo', 'N/A')
                         })
                         device_uuids.append(device_uuid)
-            
+
             if not cameras_onvif:
                 log_warning("Nenhuma câmera ONVIF válida encontrada, usando inserção padrão")
                 return self._inserir_cameras_padrao(totem_id)
-            
+
             log_debug(f"Encontradas {len(cameras_onvif)} câmera(s) ONVIF")
             for cam in cameras_onvif:
                 log_debug(f"Câmera {cam['camera_id']}: {cam['device_uuid']} ({cam['serial_number']})")
             
-            # Verifica se câmeras com esses UUIDs já existem
+            # Verificar se câmeras já existem
             cameras_existentes = self.verificar_cameras_onvif_existem(device_uuids)
             if len(cameras_existentes) >= len(cameras_onvif):
                 resultado['success'] = True
@@ -366,13 +389,13 @@ class SupabaseManager:
                 log_info("Câmeras ONVIF já existem - reutilizando")
                 return resultado
             
-            # Verifica se existem câmeras antigas para este totem (para fazer UPDATE)
+            # Verificar câmeras antigas
             cameras_antigas = self.verificar_cameras_existem(totem_id)
             
-            # Usa UPSERT para resolver conflitos automaticamente
+            # Usar UPSERT para resolver conflitos
             log_debug("Usando UPSERT para resolver conflitos de câmeras")
             
-            # Prepara dados para UPSERT usando device_uuid como ID
+            # Preparar dados para inserção
             cameras_data = []
             for cam in cameras_onvif:
                 cameras_data.append({
@@ -381,27 +404,27 @@ class SupabaseManager:
                     'ordem': cam['camera_id'],
                     'nome': f"Camera {cam['camera_id']} - {cam['fabricante']} {cam['modelo']}"
                 })
-            
+
             log_debug("Aplicando UPSERT com UUIDs ONVIF")
             for cam_data in cameras_data:
                 log_debug(f"{cam_data['nome']} - UUID: {cam_data['id']} - Ordem: {cam_data['ordem']}")
             
-            # Usa UPSERT para inserir/atualizar câmeras (resolve conflitos automaticamente)
+            # Executar UPSERT
             response = self.supabase.table('cameras').upsert(
                 cameras_data,
                 on_conflict='totem_id,ordem'  # Resolve conflito na constraint única
             ).execute()
-            
+
             if response.data and len(response.data) == len(cameras_onvif):
                 cameras_inseridas = response.data
                 resultado['success'] = True
                 resultado['cameras_inseridas'] = cameras_inseridas
                 resultado['message'] = 'Câmeras ONVIF processadas com sucesso via UPSERT'
-                
+
                 log_success("Câmeras ONVIF processadas com sucesso via UPSERT!")
                 for camera in cameras_inseridas:
                     log_info(f"{camera['nome']} - UUID: {camera['id']} - Ordem: {camera['ordem']}")
-                
+
                 return resultado
             else:
                 resultado['message'] = 'Falha no UPSERT das câmeras ONVIF - resposta inválida'
@@ -409,9 +432,134 @@ class SupabaseManager:
                 return resultado
                 
         except Exception as e:
-            resultado['message'] = f'Erro ao inserir câmeras ONVIF: {e}'
-            log_error(f"Erro ao inserir câmeras ONVIF: {e}")
+            log_error(f"Erro ao inserir câmeras: {e}")
+            resultado['message'] = f'Erro ao inserir câmeras: {str(e)}'
             return resultado
+    
+    def get_quadra_info(self, quadra_id):
+        """
+        Busca informações detalhadas da quadra no Supabase.
+        
+        Args:
+            quadra_id (str): UUID da quadra
+            
+        Returns:
+            dict: Resultado da operação com success e data
+        """
+        try:
+            if not self.supabase:
+                log_error("Supabase não conectado!")
+                return {
+                    'success': False,
+                    'message': 'Supabase não conectado',
+                    'data': None
+                }
+            
+            log_debug(f"🔍 Buscando informações da quadra: {quadra_id}")
+            response = self.supabase.table('quadras').select('*').eq('id', quadra_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                quadra_info = response.data[0]
+                log_debug(f"✅ Quadra encontrada: {quadra_info.get('nome', 'N/A')}")
+                return {
+                    'success': True,
+                    'message': 'Quadra encontrada',
+                    'data': quadra_info
+                }
+            else:
+                log_warning(f"⚠️ Quadra não encontrada: {quadra_id}")
+                return {
+                    'success': False,
+                    'message': 'Quadra não encontrada',
+                    'data': None
+                }
+                
+        except Exception as e:
+            log_error(f"❌ Erro ao buscar informações da quadra: {e}")
+            return {
+                'success': False,
+                'message': f'Erro ao consultar quadra: {e}',
+                'data': None
+            }
+    
+    def get_arena_info(self, arena_id):
+        """
+        Busca informações detalhadas da arena no Supabase.
+        
+        Args:
+            arena_id (str): UUID da arena
+            
+        Returns:
+            dict: Resultado da operação com success e data
+        """
+        try:
+            if not self.supabase:
+                log_error("Supabase não conectado!")
+                return {
+                    'success': False,
+                    'message': 'Supabase não conectado',
+                    'data': None
+                }
+            
+            log_debug(f"🔍 Buscando informações da arena: {arena_id}")
+            response = self.supabase.table('arenas').select('*').eq('id', arena_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                arena_info = response.data[0]
+                log_debug(f"✅ Arena encontrada: {arena_info.get('nome', 'N/A')}")
+                return {
+                    'success': True,
+                    'message': 'Arena encontrada',
+                    'data': arena_info
+                }
+            else:
+                log_warning(f"⚠️ Arena não encontrada: {arena_id}")
+                return {
+                    'success': False,
+                    'message': 'Arena não encontrada',
+                    'data': None
+                }
+                
+        except Exception as e:
+            log_error(f"❌ Erro ao buscar informações da arena: {e}")
+            return {
+                'success': False,
+                'message': f'Erro ao consultar arena: {e}',
+                'data': None
+            }
+    
+    def sanitize_folder_name(self, nome):
+        """
+        Limpa nomes para uso em caminhos de arquivo.
+        Remove caracteres especiais, espaços e substitui por underscores.
+        
+        Args:
+            nome (str): Nome original
+            
+        Returns:
+            str: Nome sanitizado para uso em pastas
+        """
+        if not nome or not isinstance(nome, str):
+            return "nome_invalido"
+        
+        # Remove caracteres especiais, mantém apenas letras, números, espaços, hífens e underscores
+        nome_limpo = re.sub(r'[^\w\s\-_.]', '', nome)
+        
+        # Substitui espaços por underscores
+        nome_limpo = re.sub(r'\s+', '_', nome_limpo)
+        
+        # Remove underscores múltiplos
+        nome_limpo = re.sub(r'_+', '_', nome_limpo)
+        
+        # Remove underscores no início e fim
+        nome_limpo = nome_limpo.strip('_')
+        
+        # Se ficou vazio, usa fallback
+        if not nome_limpo:
+            nome_limpo = "nome_sanitizado"
+        
+        log_debug(f"🧹 Nome sanitizado: '{nome}' -> '{nome_limpo}'")
+        return nome_limpo
 
     def _inserir_cameras_padrao(self, totem_id):
         """
@@ -683,48 +831,76 @@ class SupabaseManager:
         Obtém os dados do totem pelo token (Device ID).
         
         Returns:
-            dict: Dados do totem se encontrado, None caso contrário
+            dict: Resultado da operação com success e data
         """
         try:
-            if not self.device_id or not self.supabase:
-                return None
+            if not self.device_id:
+                log_error("❌ Device ID não disponível")
+                return {
+                    'success': False,
+                    'message': 'Device ID não disponível',
+                    'data': None
+                }
             
+            if not self.supabase:
+                log_error("❌ Conexão Supabase não disponível")
+                return {
+                    'success': False,
+                    'message': 'Conexão Supabase não disponível',
+                    'data': None
+                }
+            
+            log_debug(f"🔍 Buscando totem com Device ID: {self.device_id}")
             response = self.supabase.table('totens').select('*').eq('token', self.device_id).execute()
             
-            if response.data:
-                return response.data[0]
+            log_debug(f"📊 Resposta da consulta: {len(response.data) if response.data else 0} registros encontrados")
+            
+            if response.data and len(response.data) > 0:
+                totem_data = response.data[0]
+                log_success(f"✅ Totem encontrado: ID={totem_data.get('id', 'N/A')}, Quadra ID={totem_data.get('quadra_id', 'N/A')}")
+                return {
+                    'success': True,
+                    'message': 'Totem encontrado',
+                    'data': totem_data
+                }
             else:
-                return None
+                log_warning(f"⚠️ Nenhum totem encontrado com Device ID: {self.device_id}")
+                log_info("💡 Verifique se o dispositivo foi registrado no painel administrativo")
+                return {
+                    'success': False,
+                    'message': 'Totem não encontrado na base de dados',
+                    'data': None
+                }
                 
         except Exception as e:
-            print(f"❌ Erro ao obter totem: {e}")
-            return None
+            log_error(f"❌ Erro ao obter totem: {e}")
+            return {
+                'success': False,
+                'message': f'Erro ao consultar totem: {e}',
+                'data': None
+            }
     
-    def executar_verificacao_completa(self):
+    def initialize_session(self):
         """
-        Executa a verificação completa: Device ID → Supabase → Inserção Totem → Inserção Câmeras.
+        Inicializa uma nova sessão executando todas as validações necessárias.
+        Substitui o antigo executar_verificacao_completa() com validação obrigatória de arena/quadra.
         
         Returns:
-            dict: Resultado da operação com status e dados
+            dict: Resultado da operação com status e dados da sessão
         """
         resultado = {
             'success': False,
             'device_id': None,
             'totem_data': None,
             'cameras_data': None,
+            'arena_data': None,
+            'quadra_data': None,
+            'session_data': None,
             'message': ''
         }
         
         try:
-            # Verifica cache primeiro
-            if system_logger.is_cached('supabase_verification_complete'):
-                log_debug("Verificação completa já executada (cache)")
-                # Retorna dados do cache se disponível
-                cached_result = getattr(self, '_cached_verification_result', None)
-                if cached_result:
-                    return cached_result
-            
-            log_info("Executando verificação completa do Supabase")
+            log_info("🔧 Inicializando nova sessão com validações completas")
             
             # 1. Verifica Device ID
             self.device_id = self.verificar_device_id()
@@ -733,11 +909,14 @@ class SupabaseManager:
                 return resultado
             
             resultado['device_id'] = self.device_id
+            log_debug(f"✅ Device ID validado: {self.device_id}")
             
             # 2. Conecta ao Supabase
             if not self.conectar_supabase():
                 resultado['message'] = 'Falha na conexão com Supabase'
                 return resultado
+            
+            log_debug("✅ Conexão Supabase estabelecida")
             
             # 3. Insere/verifica totem
             totem_data = self.inserir_totem()
@@ -746,41 +925,99 @@ class SupabaseManager:
                 return resultado
             
             resultado['totem_data'] = totem_data
+            log_debug(f"✅ Totem validado: {totem_data['id']}")
             
-            # 4. Insere câmeras
-            log_debug(f"Processando câmeras para totem ID: {totem_data['id']}")
+            # 4. VALIDAÇÃO OBRIGATÓRIA: Verifica se totem está associado a uma quadra
+            quadra_id = totem_data.get('quadra_id')
+            if not quadra_id:
+                resultado['message'] = 'ERRO CRÍTICO: Totem não está associado a uma quadra (quadra_id é null)'
+                log_error(resultado['message'])
+                return resultado
+            
+            # 5. Busca informações da quadra
+            quadra_result = self.get_quadra_info(quadra_id)
+            if not quadra_result or not quadra_result.get('success'):
+                resultado['message'] = f'ERRO CRÍTICO: Quadra não encontrada: {quadra_id}'
+                log_error(resultado['message'])
+                return resultado
+            
+            quadra_data = quadra_result['data']
+            resultado['quadra_data'] = quadra_data
+            log_debug(f"✅ Quadra validada: {quadra_data.get('nome', 'N/A')}")
+            
+            # 6. VALIDAÇÃO OBRIGATÓRIA: Verifica se quadra está associada a uma arena
+            arena_id = quadra_data.get('arena_id')
+            if not arena_id:
+                resultado['message'] = 'ERRO CRÍTICO: Quadra não está associada a uma arena (arena_id é null)'
+                log_error(resultado['message'])
+                return resultado
+            
+            # 7. Busca informações da arena
+            arena_result = self.get_arena_info(arena_id)
+            if not arena_result or not arena_result.get('success'):
+                resultado['message'] = f'ERRO CRÍTICO: Arena não encontrada: {arena_id}'
+                log_error(resultado['message'])
+                return resultado
+            
+            arena_data = arena_result['data']
+            resultado['arena_data'] = arena_data
+            log_debug(f"✅ Arena validada: {arena_data.get('nome', 'N/A')}")
+            
+            # 8. Insere câmeras
+            log_debug(f"🔧 Processando câmeras para totem ID: {totem_data['id']}")
             cameras_resultado = self.inserir_cameras(totem_data['id'])
             
             if cameras_resultado['success']:
                 resultado['cameras_data'] = cameras_resultado['cameras_inseridas']
                 log_debug(cameras_resultado['message'])
                 
-                # 5. Verifica se as câmeras foram inseridas corretamente
-                log_debug("Verificando inserção das câmeras")
+                # 9. Verifica se as câmeras foram inseridas corretamente
+                log_debug("🔧 Verificando inserção das câmeras")
                 verificacao = self.verificar_cameras_inseridas(totem_data['id'])
                 
                 if verificacao['success']:
-                    resultado['success'] = True
-                    resultado['message'] = 'Totem e câmeras verificados/inseridos com sucesso'
+                    # 10. Cria SessionManager e gera sessão
+                    session_manager = SessionManager(self)
+                    session_result = session_manager.create_session(
+                        totem_data, arena_data, quadra_data, resultado['cameras_data']
+                    )
                     
-                    # Cache o resultado
-                    self._cached_verification_result = resultado
-                    system_logger.cache_verification('supabase_verification_complete', True)
-                    
-                    log_success("Todas as verificações concluídas com sucesso!")
+                    if session_result and isinstance(session_result, dict) and session_result.get('success'):
+                        resultado['session_data'] = session_result['session_data']
+                        resultado['success'] = True
+                        resultado['message'] = 'Sessão inicializada com sucesso - Todas as validações passaram'
+                        
+                        log_success("✅ Sessão inicializada com sucesso!")
+                        log_info(f"🏛️ Arena: {arena_data.get('nome', 'N/A')}")
+                        log_info(f"🏟️ Quadra: {quadra_data.get('nome', 'N/A')}")
+                        log_info(f"📹 Câmeras: {len(resultado['cameras_data'])}")
+                    else:
+                        resultado['message'] = f"Validações OK, mas falha ao criar sessão: {session_result.get('message', 'Erro desconhecido') if isinstance(session_result, dict) else 'Erro na criação da sessão'}"
+                        log_error(resultado['message'])
                 else:
-                    resultado['message'] = f"Totem inserido, mas erro na verificação das câmeras: {verificacao['message']}"
+                    resultado['message'] = f"Validações OK, mas erro na verificação das câmeras: {verificacao['message']}"
                     log_warning(resultado['message'])
             else:
-                resultado['message'] = f"Totem inserido, mas falha nas câmeras: {cameras_resultado['message']}"
+                resultado['message'] = f"Validações OK, mas falha nas câmeras: {cameras_resultado['message']}"
                 log_warning(resultado['message'])
             
             return resultado
             
         except Exception as e:
-            resultado['message'] = f'Erro na verificação completa: {e}'
-            log_error(f"Erro na verificação completa: {e}")
+            resultado['message'] = f'Erro na inicialização da sessão: {e}'
+            log_error(f"❌ Erro na inicialização da sessão: {e}")
             return resultado
+    
+    def executar_verificacao_completa(self):
+        """
+        MÉTODO DEPRECIADO: Use initialize_session() ao invés deste método.
+        Mantido para compatibilidade com código existente.
+        
+        Returns:
+            dict: Resultado da operação
+        """
+        log_warning("⚠️ AVISO: executar_verificacao_completa() está depreciado. Use initialize_session()")
+        return self.initialize_session()
 
     def get_arena_quadra_names(self):
         """
@@ -1028,21 +1265,680 @@ class SupabaseManager:
             return resultado
 
 
+class SessionManager:
+    """
+    Gerenciador de sessões para cache de validações do Supabase.
+    Responsável por criar, validar e gerenciar sessões com dados validados.
+    INCLUI VALIDAÇÕES OBRIGATÓRIAS CRÍTICAS para inicialização do sistema.
+    """
+    
+    def __init__(self, supabase_manager):
+        """
+        Inicializa o gerenciador de sessões.
+        
+        Args:
+            supabase_manager (SupabaseManager): Instância do SupabaseManager
+        """
+        self.supabase_manager = supabase_manager
+        
+        # Caminho para o arquivo de sessão
+        src_dir = Path(__file__).parent
+        device_config_dir = src_dir.parent / "device_config"
+        device_config_dir.mkdir(exist_ok=True)
+        self.session_file = device_config_dir / "session_data.json"
+        
+        # Estado da sessão
+        self.session_active = False
+        self.session_data = None
+        
+        log_debug(f"📁 SessionManager inicializado - Arquivo: {self.session_file}")
+    
+    def validate_critical_requirements(self):
+        """
+        VALIDAÇÕES OBRIGATÓRIAS CRÍTICAS para inicialização do sistema.
+        Sistema NÃO deve inicializar se alguma validação falhar.
+        
+        Returns:
+            dict: Resultado das validações críticas
+        """
+        resultado = {
+            'success': False,
+            'message': '',
+            'details': {},
+            'should_exit': False
+        }
+        
+        try:
+            log_info("🔒 Executando validações obrigatórias críticas...")
+            
+            # A. VALIDAÇÃO ARENA/QUADRA ASSOCIATION (CRÍTICO)
+            arena_quadra_result = self._validate_arena_quadra_association()
+            resultado['details']['arena_quadra'] = arena_quadra_result
+            
+            if not arena_quadra_result['success']:
+                resultado['message'] = "❌ Dispositivo não está associado a uma arena/quadra válida"
+                resultado['should_exit'] = True
+                log_error(f"CRÍTICO: {resultado['message']}")
+                log_error("💡 Orientação: Configure a associação do dispositivo no painel administrativo")
+                return resultado
+            
+            # B. VALIDAÇÃO CÂMERAS ONVIF (CRÍTICO)
+            onvif_result = self._validate_onvif_cameras()
+            resultado['details']['onvif_cameras'] = onvif_result
+            
+            if not onvif_result['success']:
+                resultado['message'] = "❌ Dados ONVIF das câmeras não são válidos"
+                resultado['should_exit'] = True
+                log_error(f"CRÍTICO: {resultado['message']}")
+                log_error("💡 Orientação: Execute o scan ONVIF para detectar e configurar as câmeras")
+                return resultado
+            
+            # C. VALIDAÇÃO DEVICE ID CONSISTENCY (CRÍTICO)
+            device_id_result = self._validate_device_id_consistency()
+            resultado['details']['device_id'] = device_id_result
+            
+            if not device_id_result['success']:
+                resultado['message'] = "❌ Device ID inconsistente ou inválido"
+                resultado['should_exit'] = True
+                log_error(f"CRÍTICO: {resultado['message']}")
+                log_error("💡 Orientação: Possível cópia de arquivos entre dispositivos - regenere o Device ID")
+                return resultado
+            
+            # TODAS AS VALIDAÇÕES PASSARAM
+            resultado['success'] = True
+            resultado['message'] = "✅ Todas as validações críticas foram aprovadas"
+            log_success("🔒 Validações obrigatórias críticas: APROVADAS")
+            
+            return resultado
+            
+        except Exception as e:
+            log_error(f"❌ Erro durante validações críticas: {e}")
+            resultado['message'] = f"Erro interno durante validações: {e}"
+            resultado['should_exit'] = True
+            return resultado
+    
+    def _validate_arena_quadra_association(self):
+        """
+        A. VALIDAÇÃO ARENA/QUADRA ASSOCIATION (CRÍTICO)
+        
+        Validações:
+        - Totem tem quadra_id: Campo não pode ser null/vazio
+        - Quadra existe: Registro existe na tabela quadras
+        - Quadra tem arena_id: Campo não pode ser null/vazio
+        - Arena existe: Registro existe na tabela arenas
+        - Nomes válidos: Arena e quadra têm nomes não vazios
+        
+        Returns:
+            dict: Resultado da validação
+        """
+        resultado = {
+            'success': False,
+            'message': '',
+            'totem_data': None,
+            'quadra_data': None,
+            'arena_data': None
+        }
+        
+        try:
+            log_debug("🔍 Validando associação Arena/Quadra...")
+            
+            # 1. Verificar se totem existe e tem quadra_id
+            totem_data = self.supabase_manager.obter_totem_por_token()
+            if not totem_data or not totem_data.get('success'):
+                resultado['message'] = "Totem não encontrado na base de dados"
+                return resultado
+            
+            totem_info = totem_data['data']
+            quadra_id = totem_info.get('quadra_id')
+            
+            if not quadra_id:
+                resultado['message'] = "Totem não está associado a uma quadra (quadra_id é null)"
+                return resultado
+            
+            resultado['totem_data'] = totem_info
+            log_debug(f"✅ Totem válido com quadra_id: {quadra_id}")
+            
+            # 2. Verificar se quadra existe e tem arena_id
+            quadra_data = self.supabase_manager.get_quadra_info(quadra_id)
+            if not quadra_data or not quadra_data.get('success'):
+                resultado['message'] = f"Quadra {quadra_id} não encontrada na base de dados"
+                return resultado
+            
+            quadra_info = quadra_data['data']
+            arena_id = quadra_info.get('arena_id')
+            
+            if not arena_id:
+                resultado['message'] = "Quadra não está associada a uma arena (arena_id é null)"
+                return resultado
+            
+            if not quadra_info.get('nome') or quadra_info.get('nome').strip() == '':
+                resultado['message'] = "Quadra não tem nome válido"
+                return resultado
+            
+            resultado['quadra_data'] = quadra_info
+            log_debug(f"✅ Quadra válida: {quadra_info.get('nome')} (arena_id: {arena_id})")
+            
+            # 3. Verificar se arena existe e tem nome válido
+            arena_data = self.supabase_manager.get_arena_info(arena_id)
+            if not arena_data or not arena_data.get('success'):
+                resultado['message'] = f"Arena {arena_id} não encontrada na base de dados"
+                return resultado
+            
+            arena_info = arena_data['data']
+            
+            if not arena_info.get('nome') or arena_info.get('nome').strip() == '':
+                resultado['message'] = "Arena não tem nome válido"
+                return resultado
+            
+            resultado['arena_data'] = arena_info
+            log_debug(f"✅ Arena válida: {arena_info.get('nome')}")
+            
+            # VALIDAÇÃO COMPLETA
+            resultado['success'] = True
+            resultado['message'] = f"Associação válida: {arena_info.get('nome')} > {quadra_info.get('nome')}"
+            log_success(f"🏟️ Arena/Quadra: {arena_info.get('nome')} > {quadra_info.get('nome')}")
+            
+            return resultado
+            
+        except Exception as e:
+            log_error(f"❌ Erro na validação Arena/Quadra: {e}")
+            resultado['message'] = f"Erro interno: {e}"
+            return resultado
+    
+    def _validate_onvif_cameras(self):
+        """
+        B. VALIDAÇÃO CÂMERAS ONVIF (CRÍTICO)
+        
+        Validações:
+        - Arquivo ONVIF existe: camera_onvif_info_*.json presente
+        - Dados válidos: JSON pode ser lido e tem estrutura esperada
+        - UUIDs consistentes: device_uuid nas câmeras corresponde aos dados ONVIF
+        - Câmeras registradas: Existem registros na tabela cameras para o totem
+        - Correspondência: Número de câmeras ONVIF = número de câmeras registradas
+        
+        Returns:
+            dict: Resultado da validação
+        """
+        resultado = {
+            'success': False,
+            'message': '',
+            'onvif_data': None,
+            'cameras_data': None,
+            'cameras_count': 0,
+            'onvif_count': 0
+        }
+        
+        try:
+            log_debug("📹 Validando câmeras ONVIF...")
+            
+            # 1. Verificar se arquivo ONVIF existe e é válido
+            onvif_data = self.supabase_manager.carregar_informacoes_onvif()
+            if not onvif_data:
+                resultado['message'] = "Arquivo ONVIF não encontrado ou inválido"
+                return resultado
+            
+            resultado['onvif_data'] = onvif_data
+            resultado['onvif_count'] = len(onvif_data)
+            log_debug(f"✅ Arquivo ONVIF válido com {resultado['onvif_count']} câmeras")
+            
+            # 2. Verificar se totem tem câmeras registradas
+            device_id = self.supabase_manager.device_id
+            if not device_id:
+                resultado['message'] = "Device ID não disponível para verificar câmeras"
+                return resultado
+            
+            # Buscar totem para obter ID
+            totem_data = self.supabase_manager.obter_totem_por_token()
+            if not totem_data or not totem_data.get('success'):
+                resultado['message'] = "Totem não encontrado para verificar câmeras"
+                return resultado
+            
+            totem_id = totem_data['data']['id']
+            
+            # Verificar câmeras registradas
+            cameras_data = self.supabase_manager.verificar_cameras_existem(totem_id)
+            if not cameras_data:
+                resultado['message'] = "Nenhuma câmera registrada para este totem"
+                return resultado
+
+            resultado['cameras_data'] = cameras_data
+            resultado['cameras_count'] = len(cameras_data)
+            log_debug(f"✅ {resultado['cameras_count']} câmeras registradas no banco")
+            
+            # 3. Verificar correspondência de quantidade
+            if resultado['onvif_count'] != resultado['cameras_count']:
+                resultado['message'] = f"Inconsistência: {resultado['onvif_count']} câmeras ONVIF vs {resultado['cameras_count']} registradas"
+                return resultado
+            
+            # 4. Verificar UUIDs consistentes (se disponíveis)
+            device_uuids = []
+            log_debug(f"🔍 Verificando estrutura ONVIF data: {type(onvif_data)}")
+            
+            if isinstance(onvif_data, dict):
+                for camera_key, camera_info in onvif_data.items():
+                    log_debug(f"🔍 Processando {camera_key}: {type(camera_info)}")
+                    if isinstance(camera_info, dict):
+                        dispositivo = camera_info.get('dispositivo', {})
+                        device_uuid = dispositivo.get('device_uuid')
+                        if device_uuid and device_uuid != 'N/A':
+                            device_uuids.append(device_uuid)
+                    else:
+                        log_error(f"❌ camera_info não é dict: {type(camera_info)}")
+            else:
+                log_error(f"❌ onvif_data não é dict: {type(onvif_data)}")
+                resultado['message'] = f"Estrutura ONVIF inválida: esperado dict, recebido {type(onvif_data)}"
+                return resultado
+            
+            if device_uuids:
+                uuid_check = self.supabase_manager.verificar_cameras_onvif_existem(device_uuids)
+                if not uuid_check or not uuid_check.get('success'):
+                    resultado['message'] = "UUIDs ONVIF não correspondem às câmeras registradas"
+                    return resultado
+                
+                log_debug(f"✅ UUIDs ONVIF consistentes: {len(device_uuids)} verificados")
+            
+            # VALIDAÇÃO COMPLETA
+            resultado['success'] = True
+            resultado['message'] = f"Câmeras ONVIF válidas: {resultado['cameras_count']} câmeras configuradas"
+            log_success(f"📹 ONVIF: {resultado['cameras_count']} câmeras validadas")
+            
+            return resultado
+            
+        except Exception as e:
+            log_error(f"❌ Erro na validação ONVIF: {e}")
+            resultado['message'] = f"Erro interno: {e}"
+            return resultado
+    
+    def _validate_device_id_consistency(self):
+        """
+        C. VALIDAÇÃO DEVICE ID CONSISTENCY (CRÍTICO)
+        
+        Validações:
+        - Device ID válido: É um UUID válido
+        - Hardware match: Corresponde ao hardware atual
+        - Token exists: Existe na tabela totens
+        - Consistência: Device ID no arquivo = Device ID do hardware
+        
+        Returns:
+            dict: Resultado da validação
+        """
+        resultado = {
+            'success': False,
+            'message': '',
+            'device_id': None,
+            'hardware_uuid': None,
+            'file_uuid': None,
+            'token_exists': False
+        }
+        
+        try:
+            log_debug("🔑 Validando consistência do Device ID...")
+            
+            # 1. Verificar Device ID do arquivo
+            file_device_id = self.supabase_manager.device_manager.get_device_id()
+            if not file_device_id:
+                resultado['message'] = "Device ID não encontrado no arquivo"
+                return resultado
+            
+            resultado['file_uuid'] = file_device_id
+            
+            # 2. Verificar se é um UUID válido
+            try:
+                uuid.UUID(file_device_id)
+                log_debug(f"✅ Device ID é um UUID válido: {file_device_id[:8]}...")
+            except ValueError:
+                resultado['message'] = "Device ID não é um UUID válido"
+                return resultado
+            
+            # 3. Verificar Device ID do hardware
+            device_info = self.supabase_manager.device_manager.get_device_info()
+            if not device_info or 'device_id' not in device_info:
+                resultado['message'] = "Não foi possível obter Device ID do hardware"
+                return resultado
+            
+            hardware_device_id = device_info['device_id']
+            
+            resultado['hardware_uuid'] = hardware_device_id
+            
+            # 4. Verificar consistência entre arquivo e hardware
+            if file_device_id != hardware_device_id:
+                resultado['message'] = "Device ID do arquivo não corresponde ao hardware atual"
+                log_warning(f"⚠️ Arquivo: {file_device_id[:8]}... vs Hardware: {hardware_device_id[:8]}...")
+                return resultado
+            
+            resultado['device_id'] = file_device_id
+            log_debug(f"✅ Device ID consistente: {file_device_id[:8]}...")
+            
+            # 5. Verificar se token existe na tabela totens
+            token_check = self.supabase_manager.verificar_token_existe(file_device_id)
+            if not token_check:
+                resultado['message'] = "Device ID não encontrado na tabela totens"
+                return resultado
+            
+            resultado['token_exists'] = True
+            log_debug("✅ Device ID existe na tabela totens")
+            
+            # VALIDAÇÃO COMPLETA
+            resultado['success'] = True
+            resultado['message'] = f"Device ID consistente e válido: {file_device_id[:8]}..."
+            log_success(f"🔑 Device ID: {file_device_id[:8]}... (consistente)")
+            
+            return resultado
+            
+        except Exception as e:
+            log_error(f"❌ Erro na validação Device ID: {e}")
+            resultado['message'] = f"Erro interno: {e}"
+            return resultado
+    
+    def create_session(self, totem_data, arena_data, quadra_data, cameras_data):
+        """
+        Cria uma nova sessão com todas as validações executadas.
+        
+        Args:
+            totem_data (dict): Dados do totem validado
+            arena_data (dict): Dados da arena validada
+            quadra_data (dict): Dados da quadra validada
+            cameras_data (list): Lista de câmeras validadas
+            
+        Returns:
+            dict: Resultado da criação da sessão
+        """
+        resultado = {
+            'success': False,
+            'session_data': None,
+            'message': ''
+        }
+        
+        try:
+            log_info(f"🔧 create_session - tipos recebidos: arena={type(arena_data)}, quadra={type(quadra_data)}")
+            log_info("🔧 Criando nova sessão com dados validados")
+            
+            # Define timestamps para a sessão
+            now = datetime.now(timezone.utc)
+            expires_at = now + timedelta(hours=8)
+            
+            # Obtém Device ID e UUID
+            device_id = self.supabase_manager.device_id
+            device_info = self.supabase_manager.device_manager.get_device_info()
+            device_uuid = device_info.get('device_id') if device_info and isinstance(device_info, dict) else device_id
+            
+            # Carrega informações ONVIF se disponíveis
+            onvif_info = self.supabase_manager.carregar_informacoes_onvif()
+            
+            # Processa dados das câmeras
+            cameras_processed = []
+            log_debug(f"📋 Processando {len(cameras_data)} câmeras do banco:")
+            for i, camera in enumerate(cameras_data):
+                log_debug(f"   Câmera {i}: {camera}")
+                camera_info = {
+                    'id': camera.get('id') if isinstance(camera, dict) else None,
+                    'nome': camera.get('nome', 'Camera Desconhecida') if isinstance(camera, dict) else 'Camera Desconhecida',
+                    'ordem': camera.get('ordem', i+1) if isinstance(camera, dict) else i+1,  # Usar índice+1 se ordem não estiver definida
+                    'onvif_uuid': 'N/A',
+                    'serial_number': 'N/A',
+                    'ip': 'N/A',
+                    'totem_id': camera.get('totem_id') if isinstance(camera, dict) else None
+                }
+                log_debug(f"   Câmera processada: ordem={camera_info['ordem']}, nome={camera_info['nome']}")
+                
+                # Tenta encontrar dados ONVIF correspondentes
+                if onvif_info and isinstance(onvif_info, dict):
+                    log_debug(f"🔍 Buscando ONVIF para câmera ordem {camera_info['ordem']}")
+                    found_match = False
+                    for camera_key, onvif_camera in onvif_info.items():
+                        onvif_camera_id = onvif_camera.get('camera_id')
+                        log_debug(f"🔍 Verificando {camera_key}: camera_id={onvif_camera_id} vs ordem={camera_info['ordem']}")
+                        if onvif_camera_id == camera_info['ordem']:
+                            dispositivo = onvif_camera.get('dispositivo', {})
+                            configuracao = onvif_camera.get('configuracao', {})
+                            device_uuid = dispositivo.get('device_uuid', 'N/A')
+                            log_debug(f"✅ Match encontrado! {camera_key} -> UUID: {device_uuid}")
+                            camera_info.update({
+                                'onvif_uuid': device_uuid,
+                                'serial_number': dispositivo.get('serial_number', 'N/A'),
+                                'ip': configuracao.get('ip', 'N/A')
+                            })
+                            found_match = True
+                            break
+                    if not found_match:
+                        log_warning(f"⚠️ Nenhum match ONVIF encontrado para câmera ordem {camera_info['ordem']}")
+                
+                cameras_processed.append(camera_info)
+            
+            # Monta estrutura da sessão
+            session_data = {
+                'session_id': str(uuid.uuid4()),
+                'created_at': now.isoformat(),
+                'expires_at': expires_at.isoformat(),
+                'device_info': {
+                    'device_id': device_id,
+                    'device_uuid': device_uuid
+                },
+                'totem_info': {
+                    'id': totem_data.get('id'),
+                    'token': totem_data.get('token'),
+                    'quadra_id': totem_data.get('quadra_id')
+                },
+                'arena_info': {
+                    'id': arena_data.get('id'),
+                    'nome': arena_data.get('nome', 'Arena Desconhecida'),
+                    'nome_sanitizado': self.supabase_manager.sanitize_folder_name(arena_data.get('nome', 'Arena'))
+                },
+                'quadra_info': {
+                    'id': quadra_data.get('id'),
+                    'nome': quadra_data.get('nome', 'Quadra Desconhecida'),
+                    'nome_sanitizado': self.supabase_manager.sanitize_folder_name(quadra_data.get('nome', 'Quadra'))
+                },
+                'cameras': cameras_processed,
+                'supabase_config': {
+                    'url': self.supabase_manager.supabase_url,
+                    'bucket_name': os.getenv('SUPABASE_BUCKET_NAME', 'videos')
+                },
+                'validation_status': {
+                    'all_valid': True,
+                    'device_valid': True,
+                    'totem_valid': True,
+                    'arena_quadra_valid': True,
+                    'cameras_valid': len(cameras_processed) > 0,
+                    'onvif_valid': onvif_info is not None
+                }
+            }
+            
+            # Salva sessão no arquivo
+            save_result = self._save_session_to_file(session_data)
+            if not save_result['success']:
+                resultado['message'] = f"Falha ao salvar sessão: {save_result['message']}"
+                return resultado
+            
+            # Atualiza estado interno
+            self.session_data = session_data
+            self.session_active = True
+            
+            resultado['success'] = True
+            resultado['session_data'] = session_data
+            resultado['message'] = 'Sessão criada e salva com sucesso'
+            
+            log_success(f"✅ Sessão criada: {session_data['session_id']}")
+            log_info(f"⏰ Expira em: {expires_at.strftime('%d/%m/%Y %H:%M:%S')}")
+            log_info(f"📹 Câmeras na sessão: {len(cameras_processed)}")
+            
+            return resultado
+            
+        except Exception as e:
+            resultado['message'] = f'Erro ao criar sessão: {e}'
+            log_error(f"❌ Erro ao criar sessão: {e}")
+            return resultado
+    
+    def validate_session(self):
+        """
+        Verifica se a sessão existente ainda é válida.
+        
+        Returns:
+            bool: True se a sessão é válida, False caso contrário
+        """
+        try:
+            log_debug("🔍 Validando sessão existente")
+            
+            # 1. Verifica se arquivo existe
+            if not self.session_file.exists():
+                log_debug("❌ Arquivo de sessão não existe")
+                return False
+            
+            # 2. Carrega e valida JSON
+            try:
+                with open(self.session_file, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                log_warning(f"⚠️ Erro ao ler arquivo de sessão: {e}")
+                return False
+            
+            # 3. Verifica campos obrigatórios
+            required_fields = [
+                'session_id', 'created_at', 'expires_at', 'device_info',
+                'totem_info', 'arena_info', 'quadra_info', 'cameras',
+                'validation_status'
+            ]
+            
+            for field in required_fields:
+                if field not in session_data:
+                    log_warning(f"⚠️ Campo obrigatório ausente: {field}")
+                    return False
+            
+            # 4. Verifica expiração
+            try:
+                expires_at = datetime.fromisoformat(session_data['expires_at'])
+                now = datetime.now(timezone.utc)
+                
+                if now >= expires_at:
+                    log_warning("⚠️ Sessão expirada")
+                    return False
+            except ValueError as e:
+                log_warning(f"⚠️ Formato de data inválido: {e}")
+                return False
+            
+            # 5. Verifica Device ID
+            current_device_id = self.supabase_manager.device_manager.get_device_id()
+            session_device_id = session_data.get('device_info', {}).get('device_id')
+            
+            if current_device_id != session_device_id:
+                log_warning("⚠️ Device ID não corresponde")
+                return False
+            
+            # 6. Verifica status de validação
+            validation_status = session_data.get('validation_status', {})
+            if not validation_status.get('all_valid', False):
+                log_warning("⚠️ Status de validação indica problemas")
+                return False
+            
+            # Sessão válida - atualiza estado interno
+            self.session_data = session_data
+            self.session_active = True
+            
+            log_success("✅ Sessão válida encontrada")
+            log_debug(f"🆔 Session ID: {session_data['session_id']}")
+            log_debug(f"⏰ Expira em: {expires_at.strftime('%d/%m/%Y %H:%M:%S')}")
+            
+            return True
+            
+        except Exception as e:
+            log_error(f"❌ Erro na validação da sessão: {e}")
+            return False
+    
+    def get_session_data(self):
+        """
+        Retorna dados da sessão em cache para uso durante operação.
+        
+        Returns:
+            dict: Dados da sessão ou None se não houver sessão válida
+        """
+        try:
+            # Se não há sessão ativa, tenta validar
+            if not self.session_active:
+                if not self.validate_session():
+                    log_warning("⚠️ Nenhuma sessão válida disponível")
+                    return None
+            
+            log_debug("📋 Retornando dados da sessão em cache")
+            return self.session_data
+            
+        except Exception as e:
+            log_error(f"❌ Erro ao obter dados da sessão: {e}")
+            return None
+    
+    def _save_session_to_file(self, session_data):
+        """
+        Salva dados da sessão no arquivo JSON.
+        
+        Args:
+            session_data (dict): Dados da sessão
+            
+        Returns:
+            dict: Resultado da operação
+        """
+        resultado = {
+            'success': False,
+            'message': ''
+        }
+        
+        try:
+            # Garante que o diretório existe
+            self.session_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Salva com formatação legível
+            with open(self.session_file, 'w', encoding='utf-8') as f:
+                json.dump(session_data, f, indent=2, ensure_ascii=False)
+            
+            resultado['success'] = True
+            resultado['message'] = 'Sessão salva com sucesso'
+            
+            log_debug(f"💾 Sessão salva em: {self.session_file}")
+            
+        except Exception as e:
+            resultado['message'] = f'Erro ao salvar sessão: {e}'
+            log_error(f"❌ Erro ao salvar sessão: {e}")
+        
+        return resultado
+
+
 def main():
     """
-    Função principal para testar o gerenciador do Supabase.
+    Função principal para testar o gerenciador do Supabase com SessionManager.
     """
-    print("☁️ TESTE DO GERENCIADOR SUPABASE")
-    print("=" * 50)
+    print("☁️ TESTE DO GERENCIADOR SUPABASE COM SESSÕES")
+    print("=" * 60)
     print()
     
     # Cria uma instância do gerenciador
     supabase_manager = SupabaseManager()
     
-    # Executa verificação completa
-    resultado = supabase_manager.executar_verificacao_completa()
+    # Testa SessionManager primeiro
+    print("🔧 TESTANDO SESSIONMANAGER")
+    print("-" * 40)
     
-    print("\n" + "=" * 50)
+    session_manager = SessionManager(supabase_manager)
+    
+    # Verifica se há sessão válida existente
+    if session_manager.validate_session():
+        print("✅ Sessão válida encontrada - usando dados em cache")
+        session_data = session_manager.get_session_data()
+        
+        if session_data:
+            print(f"🆔 Session ID: {session_data['session_id']}")
+            print(f"🏛️ Arena: {session_data['arena_info']['nome']}")
+            print(f"🏟️ Quadra: {session_data['quadra_info']['nome']}")
+            print(f"📹 Câmeras: {len(session_data['cameras'])}")
+            print(f"⏰ Expira em: {session_data['expires_at']}")
+            return
+    else:
+        print("⚠️ Nenhuma sessão válida - criando nova sessão")
+    
+    print("\n🔧 INICIALIZANDO NOVA SESSÃO")
+    print("-" * 40)
+    
+    # Inicializa nova sessão
+    resultado = supabase_manager.initialize_session()
+    
+    print("\n" + "=" * 60)
     print("📊 RESULTADO FINAL:")
     print(f"✅ Sucesso: {resultado['success']}")
     print(f"🆔 Device ID: {resultado['device_id']}")
@@ -1051,6 +1947,14 @@ def main():
     if resultado['totem_data']:
         print(f"🏢 Totem ID: {resultado['totem_data']['id']}")
         print(f"📅 Criado em: {resultado['totem_data']['created_at']}")
+    
+    if resultado['arena_data']:
+        print(f"🏛️ Arena: {resultado['arena_data']['nome']}")
+        print(f"🆔 Arena ID: {resultado['arena_data']['id']}")
+    
+    if resultado['quadra_data']:
+        print(f"🏟️ Quadra: {resultado['quadra_data']['nome']}")
+        print(f"🆔 Quadra ID: {resultado['quadra_data']['id']}")
     
     if resultado['cameras_data']:
         print(f"📹 Câmeras inseridas: {len(resultado['cameras_data'])}")
@@ -1061,6 +1965,18 @@ def main():
             print(f"   • {nome}")
             print(f"     🆔 UUID: {uuid_camera}")
             print(f"     🔢 Ordem: {ordem}")
+    
+    if resultado['session_data']:
+        session_info = resultado['session_data']
+        print(f"\n📋 SESSÃO CRIADA:")
+        print(f"🆔 Session ID: {session_info['session_id']}")
+        print(f"⏰ Criada em: {session_info['created_at']}")
+        print(f"⏰ Expira em: {session_info['expires_at']}")
+        print(f"✅ Status: {session_info['validation_status']['all_valid']}")
+        print(f"📁 Arquivo: device_config/session_data.json")
+    
+    print("\n" + "=" * 60)
+    print("🎯 TESTE CONCLUÍDO - Verifique o arquivo session_data.json")
 
 
 if __name__ == "__main__":

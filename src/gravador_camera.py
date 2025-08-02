@@ -57,6 +57,9 @@ from system_logger import log_info, log_success, log_warning, log_error, log_deb
 # Importação para sistema de marca d'água
 from watermark_manager import WatermarkManager
 
+# Importação para gerenciamento de sessões
+from supabase_manager import SessionManager
+
 
 class CameraRecorder:
     def __init__(self, camera_url, camera_name, fps=30, buffer_seconds=25):
@@ -556,6 +559,49 @@ class CameraSystem:
         print("☁️ Inicializando gerenciador do Supabase...")
         self.supabase_manager = SupabaseManager(device_manager=self.device_manager)
         
+        # NOVO: Validar/Criar Sessão - OBRIGATÓRIO COM VALIDAÇÕES CRÍTICAS
+        log_info("🔐 Validando ou criando sessão...")
+        session_result = self._validate_or_create_session()
+        
+        # Verificar se houve falha crítica que impede inicialização
+        if not (isinstance(session_result, dict) and session_result.get('success', False)):
+            if session_result.get('critical_failure', False):
+                # FALHA CRÍTICA - SISTEMA NÃO DEVE INICIALIZAR
+                log_error("🚨 FALHA CRÍTICA DETECTADA - SISTEMA NÃO PODE INICIALIZAR")
+                log_error(f"❌ Motivo: {session_result.get('message', 'Erro desconhecido')}")
+                
+                # Exibir orientações específicas baseadas no tipo de falha
+                validation_details = session_result.get('validation_details', {})
+                
+                if 'arena_quadra' in validation_details:
+                    log_error("💡 SOLUÇÃO: Configure a associação do dispositivo no painel administrativo")
+                    log_error("   - Acesse o painel de administração")
+                    log_error("   - Associe este dispositivo a uma arena e quadra válidas")
+                
+                if 'onvif_cameras' in validation_details:
+                    log_error("💡 SOLUÇÃO: Execute o scan ONVIF para detectar e configurar as câmeras")
+                    log_error("   - Execute: python src/onvif_device_info.py")
+                    log_error("   - Verifique se as câmeras estão conectadas e acessíveis")
+                
+                if 'device_id' in validation_details:
+                    log_error("💡 SOLUÇÃO: Regenere o Device ID ou verifique integridade do sistema")
+                    log_error("   - Possível cópia de arquivos entre dispositivos")
+                    log_error("   - Execute: python src/device_manager.py --regenerate")
+                
+                log_error("🚫 SISTEMA SERÁ ENCERRADO - Corrija os problemas acima antes de reiniciar")
+                
+                if session_result.get('should_exit', True):
+                    sys.exit(1)
+            else:
+                # Falha não crítica - continuar com aviso
+                log_warning(f"⚠️ Problema na sessão: {session_result.get('message', 'Erro desconhecido')}")
+                log_warning("🔄 Sistema continuará mas funcionalidade pode ser limitada")
+                self.session_data = None
+        else:
+            # Sucesso - armazenar dados da sessão
+            self.session_data = session_result.get('session_data')
+            log_success(f"✅ Sessão validada: Arena '{self.session_data['arena_info']['nome']}' / Quadra '{self.session_data['quadra_info']['nome']}'")
+        
         # Replay Manager será inicializado após conexão com Supabase
         self.replay_manager = None
         
@@ -585,6 +631,9 @@ class CameraSystem:
                 print(f"✅ QR Code existente encontrado:")
                 print(f"   📱 PNG: {qr_status['png_file'].name}")
                 print(f"   📄 Base64: {qr_status['base64_file'].name}")
+                
+                # Enviar QR code existente para Supabase
+                self._upload_qr_code_to_supabase(qr_status['base64_file'])
             else:
                 print("🔳 Gerando novo QR Code do Device ID...")
                 qr_result = self.qr_generator.generate_device_qr_code()
@@ -594,6 +643,9 @@ class CameraSystem:
                     print(f"   📱 PNG: {qr_result['files']['png_image']}")
                     print(f"   📄 Base64: {qr_result['files']['base64_file']}")
                     print(f"   📋 Info: {qr_result['files']['info_file']}")
+                    
+                    # Enviar novo QR code para Supabase
+                    self._upload_qr_code_to_supabase(qr_result['files']['base64_file'])
                 else:
                     print(f"❌ Erro ao gerar QR Code: {qr_result['error']}")
                     
@@ -601,6 +653,48 @@ class CameraSystem:
             print(f"❌ Erro na inicialização do QR Code: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _upload_qr_code_to_supabase(self, base64_file_path):
+        """Envia o QR code base64 para a tabela totens no Supabase"""
+        try:
+            print("☁️ Enviando QR Code para Supabase...")
+            
+            # Verificar se Supabase está conectado
+            if not self.supabase_manager or not self.supabase_manager.supabase:
+                print("⚠️ Supabase não conectado - QR code não será enviado")
+                return False
+            
+            # Ler o conteúdo base64 do arquivo
+            from pathlib import Path
+            base64_path = Path(base64_file_path)
+            
+            if not base64_path.exists():
+                print(f"❌ Arquivo base64 não encontrado: {base64_path}")
+                return False
+            
+            with open(base64_path, 'r', encoding='utf-8') as f:
+                qr_code_base64 = f.read().strip()
+            
+            if not qr_code_base64:
+                print("❌ Conteúdo base64 vazio")
+                return False
+            
+            # Enviar para Supabase
+            success = self.supabase_manager.atualizar_qr_code_totem(qr_code_base64)
+            
+            if success:
+                print("✅ QR Code enviado para Supabase com sucesso!")
+                log_success(f"QR Code base64 atualizado na tabela totens")
+                return True
+            else:
+                print("❌ Falha ao enviar QR Code para Supabase")
+                log_error("Falha ao atualizar QR code na tabela totens")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Erro ao enviar QR Code para Supabase: {e}")
+            log_error(f"Erro ao enviar QR code para Supabase: {e}")
+            return False
         
     def _initialize_replay_manager(self):
         """Inicializa o ReplayManager após conexão com Supabase"""
@@ -619,6 +713,101 @@ class CameraSystem:
         except Exception as e:
             log_error(f"Erro ao inicializar ReplayManager: {e}")
             return False
+    
+    def _validate_or_create_session(self):
+        """Gerencia validação de sessão existente ou criação de nova
+        INCLUI VALIDAÇÕES OBRIGATÓRIAS CRÍTICAS que impedem inicialização do sistema"""
+        try:
+            # Instanciar SessionManager
+            session_manager = SessionManager(self.supabase_manager)
+            
+            # ETAPA 1: VALIDAÇÕES OBRIGATÓRIAS CRÍTICAS
+            log_info("🔒 Executando validações obrigatórias críticas...")
+            critical_validation = session_manager.validate_critical_requirements()
+            
+            if not critical_validation['success']:
+                # FALHA CRÍTICA - SISTEMA NÃO DEVE INICIALIZAR
+                log_error(f"🚨 FALHA CRÍTICA: {critical_validation['message']}")
+                
+                # Exibir detalhes das validações
+                details = critical_validation.get('details', {})
+                if 'arena_quadra' in details:
+                    arena_result = details['arena_quadra']
+                    log_error(f"   Arena/Quadra: {arena_result.get('message', 'Erro desconhecido')}")
+                
+                if 'onvif_cameras' in details:
+                    onvif_result = details['onvif_cameras']
+                    log_error(f"   ONVIF Câmeras: {onvif_result.get('message', 'Erro desconhecido')}")
+                
+                if 'device_id' in details:
+                    device_result = details['device_id']
+                    log_error(f"   Device ID: {device_result.get('message', 'Erro desconhecido')}")
+                
+                # Retornar falha crítica que impede inicialização
+                return {
+                    'success': False,
+                    'session_data': None,
+                    'message': critical_validation['message'],
+                    'critical_failure': True,
+                    'should_exit': critical_validation.get('should_exit', True),
+                    'validation_details': details
+                }
+            
+            # ETAPA 2: VALIDAÇÕES CRÍTICAS APROVADAS - Prosseguir com sessão
+            log_success("🔒 Validações críticas aprovadas - prosseguindo com sessão")
+            
+            # Tentar validar sessão existente
+            log_debug("🔍 Verificando sessão existente...")
+            validation_result = session_manager.validate_session()
+            
+            if validation_result:
+                # Sessão válida - carregar dados
+                log_info("✅ Sessão existente válida encontrada")
+                session_data = session_manager.get_session_data()
+                if session_data:
+                    return {
+                        'success': True,
+                        'session_data': session_data,
+                        'message': 'Sessão existente carregada com sucesso',
+                        'critical_failure': False
+                    }
+                else:
+                    log_warning("⚠️ Sessão válida mas dados não puderam ser carregados")
+            
+            # Sessão inválida ou inexistente - criar nova
+            log_info("🔄 Criando nova sessão...")
+            session_result = self.supabase_manager.initialize_session()
+            
+            if session_result and isinstance(session_result, dict) and session_result.get('success') and 'session_data' in session_result:
+                log_success("✅ Nova sessão criada com sucesso")
+                return {
+                    'success': True,
+                    'session_data': session_result.get('session_data'),
+                    'message': 'Nova sessão criada com sucesso',
+                    'critical_failure': False
+                }
+            else:
+                # Falha na criação da sessão
+                if isinstance(session_result, dict):
+                    error_msg = session_result.get('message', 'Erro desconhecido na criação da sessão')
+                else:
+                    error_msg = 'Falha na inicialização da sessão - retorno inválido'
+                return {
+                    'success': False,
+                    'session_data': None,
+                    'message': f'Falha na criação da sessão: {error_msg}',
+                    'critical_failure': False
+                }
+                
+        except Exception as e:
+            log_error(f"❌ Erro crítico na validação/criação da sessão: {e}")
+            return {
+                'success': False,
+                'session_data': None,
+                'message': f'Erro crítico: {str(e)}',
+                'critical_failure': True,
+                'should_exit': True
+            }
     
     def load_config(self):
         """Carrega as configurações do arquivo config.env"""
@@ -830,6 +1019,29 @@ class CameraSystem:
     def start_system(self):
         """Inicia o sistema de câmeras"""
         print("Iniciando sistema de câmeras...")
+        
+        # NOVO: Verificações obrigatórias de sessão
+        if not hasattr(self, 'session_data') or not self.session_data:
+            log_error("❌ ERRO CRÍTICO: Sessão não encontrada")
+            log_error("🚫 Sistema não pode iniciar sem sessão válida")
+            return False
+        
+        # Verificar se arena/quadra estão definidas na sessão
+        if not self.session_data.get('arena_info') or not self.session_data.get('quadra_info'):
+            log_error("❌ ERRO CRÍTICO: Arena/Quadra não definidas na sessão")
+            log_error("🚫 Sistema não pode iniciar sem associação válida")
+            return False
+        
+        # Verificar dados obrigatórios
+        required_fields = ['arena_info', 'quadra_info', 'cameras']
+        for field in required_fields:
+            if field not in self.session_data:
+                log_error(f"❌ ERRO CRÍTICO: Campo obrigatório '{field}' ausente na sessão")
+                log_error("🚫 Sistema não pode iniciar com dados incompletos")
+                return False
+        
+        log_success(f"✅ Sessão validada: Arena '{self.session_data['arena_info']['nome']}' / Quadra '{self.session_data['quadra_info']['nome']}'")
+        log_info(f"📹 {len(self.session_data['cameras'])} câmeras registradas na sessão")
         
         # Iniciar todas as câmeras
         for camera in self.cameras.values():
@@ -1081,33 +1293,31 @@ class CameraSystem:
         failed_cameras = []
         upload_results = []
         
-        # ETAPA 1: Validação OBRIGATÓRIA de arena/quadra
+        # ETAPA 1: Usar dados da sessão em cache (SEM consultas ao Supabase)
         arena_nome = None
         quadra_nome = None
         upload_enabled = False
         
         try:
-            # Buscar nomes reais da arena/quadra
-            names_result = self.supabase_manager.get_arena_quadra_names()
-            
-            if names_result['success']:
-                # Sanitizar nomes para remover espaços e caracteres especiais
-                arena_nome = self._sanitizar_nome_pasta(names_result['arena_nome'])
-                quadra_nome = self._sanitizar_nome_pasta(names_result['quadra_nome'])
-                upload_enabled = True
-                print(f"✅ Associação validada: {arena_nome} / {quadra_nome}")
-            else:
-                # VALIDAÇÃO OBRIGATÓRIA: Não salvar se não há arena/quadra válida
-                print(f"❌ SALVAMENTO BLOQUEADO: Dispositivo não associado a arena/quadra válida")
-                print(f"📋 Motivo: {names_result.get('message', 'Associação não encontrada')}")
-                print(f"🚫 Nenhum vídeo será salvo até que o dispositivo seja associado corretamente")
+            # OTIMIZAÇÃO CRÍTICA: Usar dados em cache da sessão
+            if not hasattr(self, 'session_data') or not self.session_data:
+                log_error("❌ SALVAMENTO BLOQUEADO: Dados da sessão não disponíveis")
+                log_error("🚫 Nenhum vídeo será salvo sem sessão válida")
                 return
+            
+            # Usar nomes sanitizados da sessão (já processados)
+            arena_nome = self.session_data['arena_info']['nome_sanitizado']
+            quadra_nome = self.session_data['quadra_info']['nome_sanitizado']
+            upload_enabled = True
+            
+            log_success(f"✅ Usando dados em cache: {arena_nome} / {quadra_nome}")
+            log_info(f"📊 {len(self.session_data['cameras'])} câmeras disponíveis na sessão")
                 
         except Exception as e:
-            # VALIDAÇÃO OBRIGATÓRIA: Não salvar em caso de erro na validação
-            print(f"❌ SALVAMENTO BLOQUEADO: Erro na validação da hierarquia")
-            print(f"📋 Erro: {e}")
-            print(f"🚫 Nenhum vídeo será salvo até que a conexão seja restabelecida")
+            # VALIDAÇÃO OBRIGATÓRIA: Não salvar em caso de erro nos dados da sessão
+            log_error(f"❌ SALVAMENTO BLOQUEADO: Erro ao acessar dados da sessão")
+            log_error(f"📋 Erro: {e}")
+            log_error(f"🚫 Nenhum vídeo será salvo até que a sessão seja revalidada")
             return
         
         # ETAPA 2: Salvamento e upload por câmera usando buffers sincronizados
@@ -1121,11 +1331,14 @@ class CameraSystem:
             camera = self.cameras[camera_name]
             
             try:
-                # Criar caminho com nomes reais
-                base_path = self.create_save_path_with_names(camera.camera_name, timestamp, arena_nome, quadra_nome)
+                # OTIMIZADO: Criar caminho usando dados da sessão
+                base_path = self.create_save_path_with_names(camera.camera_name, timestamp)
                 output_path = base_path.replace('.mp4', '_WEB.mp4')
                 
-                print(f"📁 [{camera_name}] Salvando localmente: {arena_nome}/{quadra_nome}/{now.strftime('%Y/%m-%B/%d/%Hh')}/")
+                # Obter nomes da sessão para log
+                arena_log = self.session_data.get('arena_info', {}).get('nome_sanitizado', 'arena_desconhecida')
+                quadra_log = self.session_data.get('quadra_info', {}).get('nome_sanitizado', 'quadra_desconhecida')
+                print(f"📁 [{camera_name}] Salvando localmente: {arena_log}/{quadra_log}/{now.strftime('%Y/%m-%B/%d/%Hh')}/")
                 
                 # Salvamento local usando buffer sincronizado
                 save_start_time = time.time()
@@ -1200,8 +1413,8 @@ class CameraSystem:
                 print(f"\n☁️ Upload {i+1}/{len(saved_files)}: {camera_name}")
                 
                 try:
-                    # Criar caminho no bucket
-                    bucket_path = self.create_bucket_path(camera.camera_name, timestamp, arena_nome, quadra_nome)
+                    # OTIMIZADO: Criar caminho no bucket usando dados da sessão
+                    bucket_path = self.create_bucket_path(camera.camera_name, timestamp)
                     
                     # Upload
                     upload_start = time.time()
@@ -1345,16 +1558,35 @@ class CameraSystem:
         if not saved_files and not failed_cameras:
             print("❌ Nenhum arquivo foi salvo.")
 
-    def create_save_path_with_names(self, camera_name, timestamp, arena_nome, quadra_nome):
-        """Cria o caminho de salvamento com nomes reais da arena/quadra"""
+    def create_save_path_with_names(self, camera_name, timestamp, arena_nome=None, quadra_nome=None):
+        """Cria o caminho de salvamento com nomes da arena/quadra
+        OTIMIZADO: Usa dados sanitizados da sessão (SEM consultas externas)
+        
+        Args:
+            camera_name (str): Nome da câmera
+            timestamp (str): Timestamp para o arquivo
+            arena_nome (str, optional): Nome da arena (DEPRECATED - usa sessão)
+            quadra_nome (str, optional): Nome da quadra (DEPRECATED - usa sessão)
+        """
         now = datetime.now()
+        
+        # OTIMIZAÇÃO CRÍTICA: Usar nomes sanitizados da sessão
+        if hasattr(self, 'session_data') and self.session_data:
+            arena_sanitizado = self.session_data.get('arena_info', {}).get('nome_sanitizado', 'arena_desconhecida')
+            quadra_sanitizado = self.session_data.get('quadra_info', {}).get('nome_sanitizado', 'quadra_desconhecida')
+            log_debug(f"✅ Usando nomes da sessão: {arena_sanitizado}/{quadra_sanitizado}")
+        else:
+            # Fallback para parâmetros (compatibilidade)
+            arena_sanitizado = arena_nome or 'arena_desconhecida'
+            quadra_sanitizado = quadra_nome or 'quadra_desconhecida'
+            log_warning(f"⚠️ Usando fallback para nomes: {arena_sanitizado}/{quadra_sanitizado}")
         
         # Caminho base na raiz do projeto
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_dir)
         
-        # Hierarquia com nomes reais
-        base_path = os.path.join(project_root, arena_nome, quadra_nome)
+        # Hierarquia com nomes sanitizados
+        base_path = os.path.join(project_root, arena_sanitizado, quadra_sanitizado)
         year = now.strftime("%Y")
         month = now.strftime("%m-%B")
         day = now.strftime("%d")
@@ -1366,9 +1598,28 @@ class CameraSystem:
         full_path = os.path.join(base_path, year, month, day, hour, filename)
         return full_path
 
-    def create_bucket_path(self, camera_name, timestamp, arena_nome, quadra_nome):
-        """Cria o caminho no bucket com estrutura hierárquica"""
+    def create_bucket_path(self, camera_name, timestamp, arena_nome=None, quadra_nome=None):
+        """Cria o caminho no bucket com estrutura hierárquica
+        OTIMIZADO: Usa dados sanitizados da sessão (SEM consultas externas)
+        
+        Args:
+            camera_name (str): Nome da câmera
+            timestamp (str): Timestamp para o arquivo
+            arena_nome (str, optional): Nome da arena (DEPRECATED - usa sessão)
+            quadra_nome (str, optional): Nome da quadra (DEPRECATED - usa sessão)
+        """
         now = datetime.now()
+        
+        # OTIMIZAÇÃO CRÍTICA: Usar nomes sanitizados da sessão
+        if hasattr(self, 'session_data') and self.session_data:
+            arena_sanitizado = self.session_data.get('arena_info', {}).get('nome_sanitizado', 'arena_desconhecida')
+            quadra_sanitizado = self.session_data.get('quadra_info', {}).get('nome_sanitizado', 'quadra_desconhecida')
+            log_debug(f"✅ Usando nomes da sessão para bucket: {arena_sanitizado}/{quadra_sanitizado}")
+        else:
+            # Fallback para parâmetros (compatibilidade)
+            arena_sanitizado = arena_nome or 'arena_desconhecida'
+            quadra_sanitizado = quadra_nome or 'quadra_desconhecida'
+            log_warning(f"⚠️ Usando fallback para bucket: {arena_sanitizado}/{quadra_sanitizado}")
         
         # Estrutura hierárquica no bucket
         year = now.strftime("%Y")
@@ -1380,7 +1631,7 @@ class CameraSystem:
         filename = f"{camera_name}_{timestamp}_WEB.mp4"
         
         # Caminho completo no bucket
-        bucket_path = f"{arena_nome}/{quadra_nome}/{year}/{month}/{day}/{hour}/{filename}"
+        bucket_path = f"{arena_sanitizado}/{quadra_sanitizado}/{year}/{month}/{day}/{hour}/{filename}"
         return bucket_path
     
     def create_save_path_with_timestamp(self, camera_name, timestamp):
@@ -1474,7 +1725,7 @@ class CameraSystem:
     def _get_camera_uuid_from_name(self, camera_name):
         """
         Obtém UUID da câmera baseado no nome (Camera_1, Camera_2)
-        Usa dados ONVIF cadastrados na tabela cameras
+        OTIMIZADO: Usa dados em cache da sessão (SEM consultas ao Supabase)
         
         Args:
             camera_name (str): Nome da câmera (ex: "Camera_1")
@@ -1483,50 +1734,34 @@ class CameraSystem:
             str: UUID da câmera
         """
         try:
-            # Tentar obter informações ONVIF primeiro
-            onvif_info = self.get_onvif_info()
-            
-            if onvif_info:
-                # Mapear nome da câmera para chave ONVIF (Camera_1 -> camera_1)
-                camera_key = camera_name.lower()  # Camera_1 -> camera_1
+            # OTIMIZAÇÃO CRÍTICA: Usar dados em cache da sessão
+            if hasattr(self, 'session_data') and self.session_data and 'cameras' in self.session_data:
+                # Extrair número da câmera (Camera_1 -> 1)
+                camera_number = camera_name.split('_')[-1] if '_' in camera_name else '1'
+                camera_index = int(camera_number) - 1  # Converter para índice (0-based)
                 
-                log_debug(f"Buscando UUID ONVIF para {camera_name} (chave: {camera_key})")
-                
-                if camera_key in onvif_info:
-                    device_info = onvif_info[camera_key].get('dispositivo', {})
-                    device_uuid = device_info.get('device_uuid')
+                # Buscar na lista de câmeras da sessão
+                if 0 <= camera_index < len(self.session_data['cameras']):
+                    camera_data = self.session_data['cameras'][camera_index]
+                    camera_uuid = camera_data.get('id')
                     
-                    if device_uuid and device_uuid != 'N/A':
-                        log_debug(f"UUID ONVIF encontrado para {camera_name}: {device_uuid}")
-                        return device_uuid
+                    # Se id for null, usar onvif_uuid como fallback
+                    if not camera_uuid:
+                        camera_uuid = camera_data.get('onvif_uuid')
+                        if camera_uuid:
+                            log_debug(f"✅ UUID ONVIF encontrado na sessão para {camera_name}: {camera_uuid}")
+                            return camera_uuid
+                        else:
+                            log_warning(f"⚠️ Nem id nem onvif_uuid encontrados nos dados da câmera {camera_name}")
                     else:
-                        log_warning(f"UUID ONVIF inválido para {camera_name}: {device_uuid}")
-                else:
-                    log_warning(f"Chave {camera_key} não encontrada no ONVIF. Chaves disponíveis: {list(onvif_info.keys())}")
-            
-            # Fallback: Buscar diretamente na tabela cameras do Supabase
-            log_info(f"Tentando buscar UUID na tabela cameras para {camera_name}")
-            
-            if self.supabase_manager and self.supabase_manager.supabase:
-                try:
-                    # Extrair número da câmera (Camera_1 -> 1)
-                    camera_number = camera_name.split('_')[-1] if '_' in camera_name else '1'
-                    
-                    # Buscar câmera por ordem na tabela
-                    response = self.supabase_manager.supabase.table('cameras').select('id, nome, ordem').eq('ordem', int(camera_number)).execute()
-                    
-                    if response.data:
-                        camera_data = response.data[0]
-                        camera_uuid = camera_data['id']
-                        log_success(f"UUID encontrado na tabela cameras para {camera_name}: {camera_uuid}")
+                        log_debug(f"✅ UUID encontrado na sessão para {camera_name}: {camera_uuid}")
                         return camera_uuid
-                    else:
-                        log_warning(f"Câmera com ordem {camera_number} não encontrada na tabela")
-                        
-                except Exception as db_error:
-                    log_error(f"Erro ao buscar na tabela cameras: {db_error}")
+                else:
+                    log_warning(f"⚠️ Índice {camera_index} fora do range para {camera_name} (total: {len(self.session_data['cameras'])})")
+            else:
+                log_warning("⚠️ Dados da sessão não disponíveis para busca de UUID")
             
-            # Fallback final: gerar UUID determinístico (mas alertar que não será encontrado)
+            # Fallback: gerar UUID determinístico (mas alertar que não será encontrado)
             import hashlib
             import uuid
             
@@ -1710,7 +1945,7 @@ def main():
                 system._initialize_replay_manager()
                 
                 # Execução automática do Supabase (sem logs duplicados)
-                resultado = system.supabase_manager.executar_verificacao_completa()
+                resultado = system.supabase_manager.initialize_session()
                 
                 if resultado['success']:
                     log_success("✅ Supabase Integration (totem e câmeras)")
