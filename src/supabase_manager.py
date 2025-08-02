@@ -409,10 +409,12 @@ class SupabaseManager:
             for cam_data in cameras_data:
                 log_debug(f"{cam_data['nome']} - UUID: {cam_data['id']} - Ordem: {cam_data['ordem']}")
             
-            # Executar UPSERT
+            # Executar UPSERT com conflito correto
+            # Há duas constraints únicas: id (PK) e totem_id+ordem
+            # Para câmeras ONVIF, o conflito pode ser em qualquer uma
             response = self.supabase.table('cameras').upsert(
                 cameras_data,
-                on_conflict='totem_id,ordem'  # Resolve conflito na constraint única
+                on_conflict='totem_id,ordem'  # Resolve conflito na constraint totem_id+ordem
             ).execute()
 
             if response.data and len(response.data) == len(cameras_onvif):
@@ -603,8 +605,12 @@ class SupabaseManager:
                 }
             ]
             
-            # Insere as câmeras na tabela cameras
-            response = self.supabase.table('cameras').insert(cameras_data).execute()
+            # Usa UPSERT para evitar conflitos de duplicação
+            # Se câmeras já existem com mesmo totem_id e ordem, atualiza
+            response = self.supabase.table('cameras').upsert(
+                cameras_data,
+                on_conflict='totem_id,ordem'  # Para câmeras padrão, conflito é em totem_id+ordem
+            ).execute()
             
             if response.data and len(response.data) == 2:
                 cameras_inseridas = response.data
@@ -1187,6 +1193,19 @@ class SupabaseManager:
                     if 'Payload too large' in error_msg or '413' in error_msg:
                         resultado['message'] = f'Arquivo muito grande para o bucket ({file_size_mb:.1f}MB)'
                         resultado['error_code'] = 413
+                        return resultado
+                    
+                    # Verificar se é erro de duplicata (409)
+                    if ('409' in error_msg or 'Duplicate' in error_msg or 'already exists' in error_msg):
+                        log_info(f"✅ Arquivo já existe no bucket - considerando como sucesso")
+                        log_info(f"📂 Caminho: {bucket_path}")
+                        
+                        upload_time = time.time() - start_time
+                        resultado['success'] = True
+                        resultado['upload_time'] = upload_time
+                        resultado['message'] = f'Arquivo já existe (duplicata) - {upload_time:.1f}s'
+                        resultado['attempt'] = attempt + 1
+                        resultado['duplicate'] = True
                         return resultado
                     
                     if attempt < max_retries and enable_retry:

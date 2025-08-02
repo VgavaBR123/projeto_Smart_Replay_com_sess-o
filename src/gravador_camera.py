@@ -60,6 +60,10 @@ from watermark_manager import WatermarkManager
 # Importação para gerenciamento de sessões
 from supabase_manager import SessionManager
 
+# Importação para verificação de conectividade de rede
+from network_checker import NetworkConnectivityChecker
+from offline_upload_manager import get_upload_manager
+
 
 class CameraRecorder:
     def __init__(self, camera_url, camera_name, fps=30, buffer_seconds=25):
@@ -559,6 +563,10 @@ class CameraSystem:
         print("☁️ Inicializando gerenciador do Supabase...")
         self.supabase_manager = SupabaseManager(device_manager=self.device_manager)
         
+        # Inicializar Network Connectivity Checker
+        print("🌐 Inicializando verificador de conectividade...")
+        self.network_checker = NetworkConnectivityChecker()
+        
         # NOVO: Validar/Criar Sessão - OBRIGATÓRIO COM VALIDAÇÕES CRÍTICAS
         log_info("🔐 Validando ou criando sessão...")
         session_result = self._validate_or_create_session()
@@ -608,6 +616,10 @@ class CameraSystem:
         # Inicializar Hierarchical Video Manager
         print("🎬 Inicializando gerenciador hierárquico de vídeos...")
         self.hierarchical_video_manager = HierarchicalVideoManager()
+        
+        # Inicializar Offline Upload Manager
+        print("📤 Inicializando gerenciador de upload offline...")
+        self.offline_upload_manager = get_upload_manager()
         
         # Obter Device ID único
         self.device_id = self.device_manager.get_device_id()
@@ -1396,9 +1408,22 @@ class CameraSystem:
         
         print(f"🏁 Processamento paralelo concluído: {len(saved_files)} sucessos, {len(failed_cameras)} falhas")
         
-        # ETAPA 3: Upload sequencial (para evitar sobrecarga do Supabase)
+        # ETAPA 3: Verificação de conectividade antes do upload
+        connectivity_result = None
         if saved_files and upload_enabled:
-            print(f"\n☁️ Iniciando uploads sequenciais para {len(saved_files)} arquivos...")
+            log_info("🌐 Verificando conectividade de rede antes do upload...")
+            connectivity_result = self.network_checker.check_full_connectivity()
+            
+            if connectivity_result['upload_enabled']:
+                log_success(f"✅ {connectivity_result['message']}")
+                print(f"\n☁️ Iniciando uploads sequenciais para {len(saved_files)} arquivos...")
+            else:
+                log_warning(f"⚠️ {connectivity_result['message']}")
+                print(f"\n📁 Mantendo {len(saved_files)} arquivos localmente (sistema offline)")
+                upload_enabled = False
+        
+        # ETAPA 4: Upload sequencial (apenas se conectividade OK)
+        if saved_files and upload_enabled and connectivity_result and connectivity_result['upload_enabled']:
             
             for i, output_path in enumerate(saved_files):
                 # Encontrar o resultado correspondente
@@ -1514,26 +1539,42 @@ class CameraSystem:
                         'local_file_deleted': False
                     })
         else:
-            # Sem upload - criar resultados vazios
+            # Sistema offline ou sem upload - criar resultados para arquivos locais
             upload_results = []
             for result in save_results:
                 if result['success']:
+                    error_message = 'Sistema offline - arquivo mantido localmente'
+                    if connectivity_result and not connectivity_result['upload_enabled']:
+                        if not connectivity_result['internet_online']:
+                            error_message = 'Sem conectividade com internet - arquivo mantido localmente'
+                        elif not connectivity_result['supabase_online']:
+                            error_message = 'Supabase inacessível - arquivo mantido localmente'
+                    elif not upload_enabled:
+                        error_message = 'Upload não autorizado - dispositivo não associado'
+                    
                     upload_results.append({
                         'camera': result['camera_name'],
                         'success': False,
-                        'error': 'Upload não autorizado - dispositivo não associado',
-                        'local_file_deleted': False
+                        'error': error_message,
+                        'local_file_deleted': False,
+                        'local_path': result['output_path']
                     })
         
-        # ETAPA 3: Relatório final consolidado
+        # ETAPA 5: Relatório final consolidado
         print(f"\n📊 RELATÓRIO FINAL:")
         
         if saved_files:
             successful_uploads = [r for r in upload_results if r['success']]
             failed_uploads = [r for r in upload_results if not r['success']]
             deleted_files = [r for r in upload_results if r.get('local_file_deleted', False)]
+            local_files = [r for r in upload_results if not r['success'] and r.get('local_path')]
             
-            if upload_enabled:
+            # Mostrar status de conectividade
+            if connectivity_result:
+                connectivity_status = self.network_checker.get_connectivity_status_summary()
+                print(f"🌐 Status de conectividade: {connectivity_status}")
+            
+            if upload_enabled and connectivity_result and connectivity_result['upload_enabled']:
                 print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} vídeos salvos localmente e {len(successful_uploads)}/{len(saved_files)} enviados para bucket")
                 print(f"🗑️ Limpeza: {len(deleted_files)}/{len(successful_uploads)} arquivos locais excluídos automaticamente")
                 
@@ -1549,8 +1590,21 @@ class CameraSystem:
                     for result in failed_uploads:
                         print(f"   • {result['camera']}: {result['error']}")
             else:
-                print(f"📊 Status: {len(saved_files)}/{len(self.cameras)} localmente - Upload não autorizado")
-                print(f"🗑️ Limpeza: 0 arquivos excluídos (upload desabilitado)")
+                # Sistema offline - mostrar arquivos mantidos localmente
+                print(f"📁 Status: {len(saved_files)}/{len(self.cameras)} vídeos salvos e mantidos localmente")
+                total_local_size = sum(r.get('file_size', 0) for r in save_results if r['success'])
+                print(f"💾 Espaço utilizado: {total_local_size:.1f} MB")
+                
+                if local_files:
+                    print(f"📂 Arquivos mantidos localmente:")
+                    for result in local_files:
+                        local_path = result.get('local_path', 'Caminho não disponível')
+                        print(f"   • {result['camera']}: {local_path}")
+                        
+                        # Adicionar à fila de upload offline
+                        self._add_to_offline_queue(result)
+                    
+                    print(f"\n💡 Os vídeos serão enviados automaticamente quando a conectividade for restaurada.")
         
         if failed_cameras:
             print(f"\n❌ Falha ao salvar câmeras: {', '.join(failed_cameras)}")
@@ -1558,6 +1612,154 @@ class CameraSystem:
         if not saved_files and not failed_cameras:
             print("❌ Nenhum arquivo foi salvo.")
 
+    def _add_to_offline_queue(self, upload_result):
+        """
+        Adiciona um vídeo à fila de upload offline.
+        
+        Args:
+            upload_result (dict): Resultado do upload contendo informações do arquivo
+        """
+        try:
+            local_path = upload_result.get('local_path')
+            if not local_path or not os.path.exists(local_path):
+                log_warning(f"⚠️ Arquivo não encontrado para fila offline: {local_path}")
+                return
+            
+            camera_name = upload_result.get('camera', 'Unknown')
+            bucket_path = upload_result.get('bucket_path', '')
+            
+            # Obter informações da sessão para arena e quadra
+            arena = None
+            quadra = None
+            session_id = None
+            
+            if hasattr(self, 'session_data') and self.session_data:
+                arena = self.session_data.get('arena_info', {}).get('nome')
+                quadra = self.session_data.get('quadra_info', {}).get('nome')
+                session_id = self.session_data.get('session_id')
+            
+            # Adicionar à fila de upload offline
+            success = self.offline_upload_manager.add_to_queue(
+                video_path=local_path,
+                camera_id=camera_name,
+                bucket_path=bucket_path,
+                session_id=session_id,
+                arena=arena,
+                quadra=quadra,
+                priority=1
+            )
+            
+            if success:
+                log_debug(f"📤 Vídeo adicionado à fila offline: {os.path.basename(local_path)}")
+            else:
+                log_warning(f"⚠️ Falha ao adicionar vídeo à fila offline: {os.path.basename(local_path)}")
+                
+        except Exception as e:
+            log_error(f"❌ Erro ao adicionar vídeo à fila offline: {e}")
+    
+    def check_upload_queue_status(self):
+        """
+        Verifica e exibe o status da fila de upload offline.
+        
+        Returns:
+            dict: Status da fila de uploads
+        """
+        try:
+            status = self.offline_upload_manager.get_queue_status()
+            
+            print("\n📤 Status da Fila de Upload Offline:")
+            print(f"   📊 Total na fila: {status['queue_size']}")
+            print(f"   ⏳ Pendentes: {status['pending']}")
+            print(f"   ✅ Concluídos: {status['completed']}")
+            print(f"   ❌ Falhados: {status['failed']}")
+            print(f"   📈 Uploads recentes (24h): {status['recent_uploads_24h']}")
+            print(f"   🔄 Monitoramento ativo: {'Sim' if status['is_monitoring'] else 'Não'}")
+            
+            stats = status.get('stats', {})
+            if stats:
+                print(f"   📈 Total processados: {stats.get('total_processed', 0)}")
+                print(f"   ✅ Sucessos: {stats.get('successful_uploads', 0)}")
+                print(f"   ❌ Falhas: {stats.get('failed_uploads', 0)}")
+            
+            return status
+            
+        except Exception as e:
+            log_error(f"❌ Erro ao verificar status da fila: {e}")
+            return {}
+    
+    def force_process_offline_queue(self):
+        """
+        Força o processamento da fila de upload offline.
+        Útil para testes ou quando se quer forçar uploads imediatamente.
+        
+        Returns:
+            dict: Resultado do processamento
+        """
+        try:
+            log_info("🔄 Forçando processamento da fila de upload offline...")
+            result = self.offline_upload_manager.force_process_queue()
+            
+            if result.get('success'):
+                log_success("✅ Processamento da fila concluído")
+                print("\n📊 Status após processamento:")
+                queue_status = result.get('queue_status', {})
+                print(f"   ⏳ Pendentes: {queue_status.get('pending', 0)}")
+                print(f"   ✅ Concluídos: {queue_status.get('completed', 0)}")
+            else:
+                log_warning(f"⚠️ Processamento falhou: {result.get('error', 'Erro desconhecido')}")
+            
+            return result
+            
+        except Exception as e:
+            log_error(f"❌ Erro ao forçar processamento da fila: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def check_network_status(self):
+        """
+        Verifica e exibe o status atual da conectividade de rede.
+        Útil para debugging e monitoramento.
+        
+        Returns:
+            dict: Resultado da verificação de conectividade
+        """
+        log_info("🔍 Verificando status de conectividade de rede...")
+        
+        try:
+            result = self.network_checker.check_full_connectivity()
+            
+            print("\n🌐 STATUS DE CONECTIVIDADE:")
+            print(f"📡 Internet: {'✅ Online' if result['internet_online'] else '❌ Offline'}")
+            print(f"☁️ Supabase: {'✅ Acessível' if result['supabase_online'] else '❌ Inacessível'}")
+            print(f"📤 Upload: {'✅ Habilitado' if result['upload_enabled'] else '❌ Desabilitado'}")
+            print(f"💬 Status: {result['message']}")
+            
+            # Detalhes adicionais se disponíveis
+            if 'details' in result:
+                details = result['details']
+                if 'internet' in details:
+                    internet_details = details['internet']
+                    if 'attempt' in internet_details:
+                        print(f"🔄 Internet verificada em {internet_details['attempt']} tentativa(s)")
+                
+                if 'supabase' in details and not details['supabase'].get('skipped', False):
+                    supabase_details = details['supabase']
+                    if 'status_code' in supabase_details:
+                        print(f"📊 Supabase respondeu com status: {supabase_details['status_code']}")
+                    if 'attempt' in supabase_details:
+                        print(f"🔄 Supabase verificado em {supabase_details['attempt']} tentativa(s)")
+            
+            return result
+            
+        except Exception as e:
+            log_error(f"❌ Erro ao verificar conectividade: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'internet_online': False,
+                'supabase_online': False,
+                'upload_enabled': False
+            }
+    
     def create_save_path_with_names(self, camera_name, timestamp, arena_nome=None, quadra_nome=None):
         """Cria o caminho de salvamento com nomes da arena/quadra
         OTIMIZADO: Usa dados sanitizados da sessão (SEM consultas externas)
