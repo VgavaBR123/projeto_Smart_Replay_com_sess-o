@@ -381,13 +381,21 @@ class SupabaseManager:
                 log_debug(f"Câmera {cam['camera_id']}: {cam['device_uuid']} ({cam['serial_number']})")
             
             # Verificar se câmeras já existem
-            cameras_existentes = self.verificar_cameras_onvif_existem(device_uuids)
+            cameras_existentes_result = self.verificar_cameras_onvif_existem(device_uuids)
+            cameras_existentes = cameras_existentes_result.get('cameras', [])
+            
+            log_debug(f"🔍 Verificação de câmeras existentes:")
+            log_debug(f"   • Câmeras ONVIF detectadas: {len(cameras_onvif)}")
+            log_debug(f"   • Câmeras já existentes no banco: {len(cameras_existentes)}")
+            
             if len(cameras_existentes) >= len(cameras_onvif):
                 resultado['success'] = True
                 resultado['cameras_inseridas'] = cameras_existentes
                 resultado['message'] = 'Câmeras ONVIF já existem - reutilizando'
                 log_info("Câmeras ONVIF já existem - reutilizando")
                 return resultado
+            
+            log_info(f"📹 Inserindo {len(cameras_onvif)} câmeras ONVIF no banco de dados...")
             
             # Verificar câmeras antigas
             cameras_antigas = self.verificar_cameras_existem(totem_id)
@@ -1330,16 +1338,16 @@ class SessionManager:
         try:
             log_info("🔒 Executando validações obrigatórias críticas...")
             
-            # A. VALIDAÇÃO ARENA/QUADRA ASSOCIATION (CRÍTICO)
+            # A. VALIDAÇÃO ARENA/QUADRA ASSOCIATION (REMOVIDA - NÃO MAIS CRÍTICA)
+            # A validação de arena/quadra agora é feita com sistema de retry no gravador_camera.py
             arena_quadra_result = self._validate_arena_quadra_association()
             resultado['details']['arena_quadra'] = arena_quadra_result
             
             if not arena_quadra_result['success']:
-                resultado['message'] = "❌ Dispositivo não está associado a uma arena/quadra válida"
-                resultado['should_exit'] = True
-                log_error(f"CRÍTICO: {resultado['message']}")
-                log_error("💡 Orientação: Configure a associação do dispositivo no painel administrativo")
-                return resultado
+                log_warning("⚠️ Arena/Quadra não associada - será verificada periodicamente")
+                log_info("💡 Sistema continuará funcionando e verificará a associação a cada 30 segundos")
+            else:
+                log_success("✅ Arena/Quadra já associada")
             
             # B. VALIDAÇÃO CÂMERAS ONVIF (CRÍTICO)
             onvif_result = self._validate_onvif_cameras()

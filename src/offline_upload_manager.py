@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from system_logger import log_info, log_success, log_warning, log_error, log_debug
 from network_checker import NetworkConnectivityChecker
 from supabase_manager import SupabaseManager
+from replay_manager import ReplayManager
 
 
 class OfflineUploadManager:
@@ -20,7 +21,16 @@ class OfflineUploadManager:
     """
     
     def __init__(self, db_path: str = None, config_env_path: str = None):
-        self.db_path = db_path or os.path.join(os.getcwd(), 'offline_data', 'upload_queue.db')
+        # Garantir que offline_data seja criado na raiz do projeto
+        if db_path is None:
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent
+            offline_data_dir = project_root / "offline_data"
+            offline_data_dir.mkdir(exist_ok=True)
+            self.db_path = str(offline_data_dir / "upload_queue.db")
+        else:
+            self.db_path = db_path
+            
         self.config_env_path = config_env_path or os.path.join(os.getcwd(), 'config.env')
         
         # Configurações padrão
@@ -34,6 +44,7 @@ class OfflineUploadManager:
         # Componentes
         self.network_checker = NetworkConnectivityChecker()
         self.supabase_manager = None
+        self.replay_manager = None
         
         # Threading
         self._running = False
@@ -51,6 +62,7 @@ class OfflineUploadManager:
         
         self._initialize_database()
         self._load_supabase_manager()
+        self._initialize_replay_manager()
         
     def _load_supabase_manager(self):
         """Carrega o SupabaseManager com configurações do ambiente."""
@@ -60,6 +72,17 @@ class OfflineUploadManager:
         except Exception as e:
             log_error(f"❌ Erro ao carregar SupabaseManager: {e}")
             self.supabase_manager = None
+    
+    def _initialize_replay_manager(self):
+        """Inicializa ReplayManager após SupabaseManager."""
+        try:
+            if self.supabase_manager and self.supabase_manager.supabase:
+                self.replay_manager = ReplayManager(supabase_manager=self.supabase_manager)
+                log_success("✅ ReplayManager inicializado no OfflineUploadManager")
+            else:
+                log_warning("⚠️ SupabaseManager não disponível para ReplayManager")
+        except Exception as e:
+            log_error(f"❌ Erro ao inicializar ReplayManager: {e}")
     
     def _initialize_database(self):
         """Inicializa o banco de dados SQLite para a fila de uploads."""
@@ -132,6 +155,45 @@ class OfflineUploadManager:
             columns = cursor.fetchall()
             column_names = [col[1] for col in columns]
             
+            # NOVA MIGRAÇÃO: Tornar checksum opcional
+            # Verificar se checksum é NOT NULL
+            checksum_info = next((col for col in columns if col[1] == 'checksum'), None)
+            if checksum_info and checksum_info[3] == 1:  # notNull = 1
+                log_info("🔄 Migração: Tornando checksum opcional")
+                # Criar nova tabela sem NOT NULL no checksum
+                cursor.execute('''
+                    CREATE TABLE upload_queue_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        video_path TEXT NOT NULL,
+                        camera_id TEXT NOT NULL,
+                        session_id TEXT,
+                        timestamp_created TEXT NOT NULL,
+                        file_size INTEGER,
+                        checksum TEXT,  -- SEM NOT NULL
+                        priority INTEGER DEFAULT 1,
+                        status TEXT DEFAULT 'pending',
+                        retry_count INTEGER DEFAULT 0,
+                        last_attempt TEXT,
+                        error_message TEXT,
+                        supabase_url TEXT,
+                        bucket_path TEXT,
+                        arena TEXT,
+                        quadra TEXT
+                    )
+                ''')
+                
+                # Copiar dados existentes
+                cursor.execute('''
+                    INSERT INTO upload_queue_new 
+                    SELECT * FROM upload_queue
+                ''')
+                
+                # Substituir tabela antiga
+                cursor.execute('DROP TABLE upload_queue')
+                cursor.execute('ALTER TABLE upload_queue_new RENAME TO upload_queue')
+                
+                log_success("✅ Migração concluída: checksum agora é opcional")
+            
             # Adiciona coluna 'arena' se não existir
             if 'arena' not in column_names:
                 log_info("🔄 Migração: Adicionando coluna 'arena'")
@@ -141,6 +203,19 @@ class OfflineUploadManager:
             if 'quadra' not in column_names:
                 log_info("🔄 Migração: Adicionando coluna 'quadra'")
                 cursor.execute("ALTER TABLE upload_queue ADD COLUMN quadra TEXT")
+            
+            # NOVA MIGRAÇÃO: Campos para registro replay
+            if 'timestamp_video' not in column_names:
+                log_info("🔄 Migração: Adicionando coluna 'timestamp_video'")
+                cursor.execute("ALTER TABLE upload_queue ADD COLUMN timestamp_video TEXT")
+            
+            if 'camera_uuid' not in column_names:
+                log_info("🔄 Migração: Adicionando coluna 'camera_uuid'")
+                cursor.execute("ALTER TABLE upload_queue ADD COLUMN camera_uuid TEXT")
+            
+            if 'replay_inserted' not in column_names:
+                log_info("🔄 Migração: Adicionando coluna 'replay_inserted'")
+                cursor.execute("ALTER TABLE upload_queue ADD COLUMN replay_inserted INTEGER DEFAULT 0")
                 
             conn.commit()
             
@@ -149,7 +224,8 @@ class OfflineUploadManager:
     
     def add_to_queue(self, video_path: str, camera_id: str, bucket_path: str, 
                      session_id: str = None, arena: str = None, quadra: str = None,
-                     priority: int = 1) -> bool:
+                     priority: int = 1, timestamp_video: str = None, 
+                     camera_uuid: str = None) -> bool:
         """Adiciona um vídeo à fila de upload offline."""
         try:
             if not os.path.exists(video_path):
@@ -176,10 +252,11 @@ class OfflineUploadManager:
                 cursor.execute('''
                     INSERT INTO upload_queue 
                     (video_path, camera_id, session_id, timestamp_created, file_size, 
-                     bucket_path, arena, quadra, priority, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                     bucket_path, arena, quadra, priority, status, timestamp_video, 
+                     camera_uuid, replay_inserted)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)
                 ''', (video_path, camera_id, session_id, timestamp_created, file_size,
-                      bucket_path, arena, quadra, priority))
+                      bucket_path, arena, quadra, priority, timestamp_video, camera_uuid))
                 
                 conn.commit()
                 
@@ -317,7 +394,8 @@ class OfflineUploadManager:
                 
                 cursor.execute('''
                     SELECT id, video_path, camera_id, session_id, bucket_path, 
-                           arena, quadra, retry_count, priority
+                           arena, quadra, retry_count, priority, timestamp_video, 
+                           camera_uuid, replay_inserted
                     FROM upload_queue 
                     WHERE status = 'pending' AND retry_count < ?
                     ORDER BY priority DESC, timestamp_created ASC
@@ -357,6 +435,12 @@ class OfflineUploadManager:
             if upload_result and upload_result.get('success'):
                 # Upload bem-sucedido
                 self._update_upload_status(upload_id, 'completed', None, upload_result.get('url'))
+                
+                # Inserir registro replay se necessário
+                if upload.get('replay_inserted', 0) == 0 and upload.get('timestamp_video') and upload.get('camera_uuid'):
+                    success_replay = self._insert_replay_record(upload, upload_result.get('url'))
+                    if success_replay:
+                        self._mark_replay_inserted(upload_id)
                 
                 # Remove arquivo local se configurado
                 if os.getenv('OFFLINE_DELETE_AFTER_UPLOAD', 'true').lower() == 'true':
@@ -466,6 +550,95 @@ class OfflineUploadManager:
                 
         except Exception as e:
             log_error(f"❌ Erro na limpeza de entradas antigas: {e}")
+    
+    def _insert_replay_record(self, upload: Dict, video_url: str) -> bool:
+        """Insere registro replay após upload bem-sucedido."""
+        try:
+            if not self.replay_manager:
+                log_warning("⚠️ ReplayManager não disponível")
+                return False
+            
+            camera_uuid = upload.get('camera_uuid')
+            timestamp_video = upload.get('timestamp_video')
+            bucket_path = upload.get('bucket_path')
+            
+            if not all([camera_uuid, timestamp_video, bucket_path]):
+                log_warning("⚠️ Dados insuficientes para registro replay")
+                return False
+            
+            # Gerar URL assinada se não tiver
+            if not video_url or not self._validar_url_completa(video_url):
+                try:
+                    from hierarchical_video_manager import HierarchicalVideoManager
+                    video_manager = HierarchicalVideoManager()
+                    if video_manager.conectar_supabase():
+                        signed_url = video_manager._obter_url_assinada(bucket_path)
+                        if signed_url and self._validar_url_completa(signed_url):
+                            video_url = signed_url
+                        else:
+                            log_error("❌ Falha ao gerar URL assinada")
+                            return False
+                    else:
+                        log_error("❌ Falha ao conectar video_manager")
+                        return False
+                except Exception as e:
+                    log_error(f"❌ Erro ao gerar URL assinada: {e}")
+                    return False
+            
+            # Converter timestamp para datetime
+            from datetime import datetime, timezone
+            try:
+                timestamp_dt = datetime.fromisoformat(timestamp_video.replace('Z', '+00:00'))
+            except:
+                log_error("❌ Erro ao converter timestamp_video")
+                return False
+            
+            # Inserir registro replay
+            result = self.replay_manager.insert_replay_record(
+                camera_id=camera_uuid,
+                video_url=video_url,
+                timestamp_video=timestamp_dt,
+                bucket_path=bucket_path
+            )
+            
+            if result.get('success'):
+                log_success(f"✅ Registro replay inserido: {upload.get('camera_id')}")
+                return True
+            else:
+                log_error(f"❌ Falha no registro replay: {result.get('error')}")
+                return False
+                
+        except Exception as e:
+            log_error(f"❌ Erro na inserção replay: {e}")
+            return False
+    
+    def _mark_replay_inserted(self, upload_id: int):
+        """Marca que o replay foi inserido para este upload."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    UPDATE upload_queue 
+                    SET replay_inserted = 1
+                    WHERE id = ?
+                ''', (upload_id,))
+                
+                conn.commit()
+                log_debug(f"✅ Replay marcado como inserido para upload ID: {upload_id}")
+                
+        except Exception as e:
+            log_error(f"❌ Erro ao marcar replay como inserido: {e}")
+    
+    def _validar_url_completa(self, url):
+        """Valida se URL é completa e funcional."""
+        if not url or not isinstance(url, str):
+            return False
+        url = url.strip()
+        return (url.startswith('https://') and
+                'supabase.co' in url and
+                '?token=' in url and
+                not url.startswith('supabase://bucket/'))
     
     def get_queue_status(self) -> Dict:
         """Retorna status atual da fila de uploads."""

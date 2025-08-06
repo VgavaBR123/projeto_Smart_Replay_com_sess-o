@@ -553,7 +553,11 @@ class CameraSystem:
         # Inicializar Device Manager e QR Generator
         print("🔧 Inicializando sistema de identificação do dispositivo...")
         self.device_manager = DeviceManager()
-        self.qr_generator = QRCodeGenerator(device_manager=self.device_manager)
+        
+        # Garantir que QR codes sejam salvos na raiz do projeto
+        from pathlib import Path
+        qr_codes_dir = Path(__file__).parent.parent / "qr_codes"
+        self.qr_generator = QRCodeGenerator(output_dir=str(qr_codes_dir), device_manager=self.device_manager)
         
         # Inicializar ONVIF Device Manager
         print("📡 Inicializando sistema ONVIF para câmeras...")
@@ -567,48 +571,29 @@ class CameraSystem:
         print("🌐 Inicializando verificador de conectividade...")
         self.network_checker = NetworkConnectivityChecker()
         
-        # NOVO: Validar/Criar Sessão - OBRIGATÓRIO COM VALIDAÇÕES CRÍTICAS
-        log_info("🔐 Validando ou criando sessão...")
-        session_result = self._validate_or_create_session()
+        # NOVO FLUXO: Primeiro registrar dispositivo e enviar dados básicos
+        log_info("🔐 Registrando dispositivo e enviando dados básicos...")
+        if not self._register_device_and_send_data():
+            log_error("❌ Falha no registro inicial do dispositivo. Sistema não pode inicializar.")
+            log_error("💡 Soluções possíveis:")
+            log_error("   1. Verificar conectividade com o Supabase")
+            log_error("   2. Verificar se as credenciais do Supabase estão corretas")
+            log_error("   3. Verificar se o Device ID foi gerado corretamente")
+            sys.exit(1)
         
-        # Verificar se houve falha crítica que impede inicialização
-        if not (isinstance(session_result, dict) and session_result.get('success', False)):
-            if session_result.get('critical_failure', False):
-                # FALHA CRÍTICA - SISTEMA NÃO DEVE INICIALIZAR
-                log_error("🚨 FALHA CRÍTICA DETECTADA - SISTEMA NÃO PODE INICIALIZAR")
-                log_error(f"❌ Motivo: {session_result.get('message', 'Erro desconhecido')}")
-                
-                # Exibir orientações específicas baseadas no tipo de falha
-                validation_details = session_result.get('validation_details', {})
-                
-                if 'arena_quadra' in validation_details:
-                    log_error("💡 SOLUÇÃO: Configure a associação do dispositivo no painel administrativo")
-                    log_error("   - Acesse o painel de administração")
-                    log_error("   - Associe este dispositivo a uma arena e quadra válidas")
-                
-                if 'onvif_cameras' in validation_details:
-                    log_error("💡 SOLUÇÃO: Execute o scan ONVIF para detectar e configurar as câmeras")
-                    log_error("   - Execute: python src/onvif_device_info.py")
-                    log_error("   - Verifique se as câmeras estão conectadas e acessíveis")
-                
-                if 'device_id' in validation_details:
-                    log_error("💡 SOLUÇÃO: Regenere o Device ID ou verifique integridade do sistema")
-                    log_error("   - Possível cópia de arquivos entre dispositivos")
-                    log_error("   - Execute: python src/device_manager.py --regenerate")
-                
-                log_error("🚫 SISTEMA SERÁ ENCERRADO - Corrija os problemas acima antes de reiniciar")
-                
-                if session_result.get('should_exit', True):
-                    sys.exit(1)
-            else:
-                # Falha não crítica - continuar com aviso
-                log_warning(f"⚠️ Problema na sessão: {session_result.get('message', 'Erro desconhecido')}")
-                log_warning("🔄 Sistema continuará mas funcionalidade pode ser limitada")
-                self.session_data = None
-        else:
+        # Verificar associação arena/quadra com sistema de verificação periódica
+        log_info("🔐 Verificando associação de arena/quadra...")
+        session_result = self._check_arena_quadra_association_with_retry()
+        
+        # Verificar resultado da associação arena/quadra
+        if isinstance(session_result, dict) and session_result.get('success', False):
             # Sucesso - armazenar dados da sessão
             self.session_data = session_result.get('session_data')
             log_success(f"✅ Sessão validada: Arena '{self.session_data['arena_info']['nome']}' / Quadra '{self.session_data['quadra_info']['nome']}'")
+        else:
+            # Falha após 15 minutos de tentativas - encerrar sistema
+            log_error("❌ Sistema será encerrado: Arena/Quadra não foi associada após 15 minutos de verificações")
+            sys.exit(1)
         
         # Replay Manager será inicializado após conexão com Supabase
         self.replay_manager = None
@@ -1277,6 +1262,9 @@ class CameraSystem:
         key_press_timestamp_utc = datetime.fromtimestamp(sync_timestamp, tz=timezone.utc)
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         
+        # NOVO: Armazenar timestamp para uso na fila offline
+        self._last_save_timestamp = key_press_timestamp_utc
+        
         print(f"🕐 Timestamp de sincronização: {sync_timestamp:.3f}")
         print(f"📅 Horário de referência: {now.strftime('%H:%M:%S.%f')[:-3]}")
         print(f"⏰ Timestamp da tecla 'S' (UTC): {key_press_timestamp_utc.strftime('%H:%M:%S.%f')[:-3]}")
@@ -1613,22 +1601,22 @@ class CameraSystem:
             print("❌ Nenhum arquivo foi salvo.")
 
     def _add_to_offline_queue(self, upload_result):
-        """
-        Adiciona um vídeo à fila de upload offline.
-        
-        Args:
-            upload_result (dict): Resultado do upload contendo informações do arquivo
-        """
+        """Adiciona vídeo à fila offline com dados para registro replay."""
         try:
             local_path = upload_result.get('local_path')
             if not local_path or not os.path.exists(local_path):
-                log_warning(f"⚠️ Arquivo não encontrado para fila offline: {local_path}")
+                log_warning(f"⚠️ Arquivo não encontrado: {local_path}")
                 return
             
             camera_name = upload_result.get('camera', 'Unknown')
-            bucket_path = upload_result.get('bucket_path', '')
             
-            # Obter informações da sessão para arena e quadra
+            # Gerar bucket_path se não existir
+            bucket_path = upload_result.get('bucket_path')
+            if not bucket_path:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bucket_path = self.create_bucket_path(camera_name, timestamp)
+            
+            # Obter dados da sessão
             arena = None
             quadra = None
             session_id = None
@@ -1638,7 +1626,15 @@ class CameraSystem:
                 quadra = self.session_data.get('quadra_info', {}).get('nome')
                 session_id = self.session_data.get('session_id')
             
-            # Adicionar à fila de upload offline
+            # NOVO: Obter UUID da câmera e timestamp original
+            camera_uuid = self._get_camera_uuid_from_name(camera_name)
+            
+            # NOVO: Obter timestamp original (do contexto de salvamento)
+            timestamp_video = None
+            if hasattr(self, '_last_save_timestamp'):
+                timestamp_video = self._last_save_timestamp.isoformat()
+            
+            # Adicionar à fila com dados completos
             success = self.offline_upload_manager.add_to_queue(
                 video_path=local_path,
                 camera_id=camera_name,
@@ -1646,16 +1642,18 @@ class CameraSystem:
                 session_id=session_id,
                 arena=arena,
                 quadra=quadra,
-                priority=1
+                priority=1,
+                timestamp_video=timestamp_video,
+                camera_uuid=camera_uuid
             )
             
             if success:
-                log_debug(f"📤 Vídeo adicionado à fila offline: {os.path.basename(local_path)}")
+                log_debug(f"📤 Vídeo adicionado à fila: {os.path.basename(local_path)}")
             else:
-                log_warning(f"⚠️ Falha ao adicionar vídeo à fila offline: {os.path.basename(local_path)}")
+                log_warning(f"⚠️ Falha na fila: {os.path.basename(local_path)}")
                 
         except Exception as e:
-            log_error(f"❌ Erro ao adicionar vídeo à fila offline: {e}")
+            log_error(f"❌ Erro fila offline: {e}")
     
     def check_upload_queue_status(self):
         """
@@ -2092,6 +2090,338 @@ class CameraSystem:
             return False
         
         return True
+
+    def _register_device_and_send_data(self):
+        """
+        Registra o dispositivo no Supabase e envia dados básicos (token, QR code e câmeras)
+        ANTES da verificação de arena/quadra.
+        
+        Returns:
+            bool: True se o registro foi bem-sucedido
+        """
+        try:
+            log_info("📋 Iniciando registro do dispositivo...")
+            
+            # 1. Obter Device ID
+            device_id = self.device_manager.get_device_id()
+            if not device_id:
+                log_error("❌ Falha ao obter Device ID")
+                return False
+            
+            log_success(f"✅ Device ID obtido: {device_id[:8]}...")
+            
+            # 2. Conectar ao Supabase
+            if not self.supabase_manager.conectar_supabase():
+                log_error("❌ Falha na conexão com Supabase")
+                return False
+            
+            log_success("✅ Conectado ao Supabase")
+            
+            # 3. Verificar se o token já existe ou inserir novo totem
+            totem_existente = self.supabase_manager.verificar_token_existe(device_id)
+            
+            if totem_existente:
+                log_info(f"🔍 Totem existente encontrado: ID {totem_existente['id']}")
+                totem_data = totem_existente
+            else:
+                # 4. Inserir novo totem
+                totem_data = self.supabase_manager.inserir_totem()
+                if not totem_data:
+                    log_error("❌ Falha ao inserir totem no Supabase")
+                    return False
+                
+                log_success(f"✅ Novo totem inserido: ID {totem_data['id']}")
+            
+            # 5. Gerar e obter QR Code
+            qr_code_base64 = self._generate_and_upload_qr_code(device_id, device_id)
+            if qr_code_base64:
+                log_success("✅ QR Code gerado e convertido para base64")
+                
+                # 6. Atualizar totem com QR Code
+                try:
+                    update_data = {'qr_code_base64': qr_code_base64}
+                    response = self.supabase_manager.supabase.table('totens').update(update_data).eq('id', totem_data['id']).execute()
+                    
+                    if response.data:
+                        log_success("✅ QR Code atualizado no totem")
+                    else:
+                        log_warning("⚠️ Falha ao atualizar QR Code no totem")
+                        
+                except Exception as e:
+                    log_warning(f"⚠️ Erro ao atualizar QR Code: {e}")
+            else:
+                log_warning("⚠️ Falha na geração do QR Code, mas continuando...")
+            
+            # 7. Detectar e enviar informações das câmeras ONVIF
+            log_info("📹 Detectando câmeras ONVIF...")
+            onvif_info = self.onvif_manager.obter_informacoes_cameras()
+            
+            if onvif_info:
+                cameras_detectadas = len([info for info in onvif_info.values() if 'error' not in info])
+                log_success(f"✅ {cameras_detectadas} câmeras ONVIF detectadas")
+                
+                # Enviar informações das câmeras usando o método existente
+                log_info(f"🔄 Iniciando inserção de câmeras para totem ID: {totem_data['id']}")
+                try:
+                    cameras_resultado = self.supabase_manager.inserir_cameras(totem_data['id'])
+                    log_info(f"📊 Resultado da inserção: {cameras_resultado}")
+                    
+                    if cameras_resultado.get('success'):
+                        cameras_inseridas = cameras_resultado.get('cameras_inseridas', [])
+                        log_success(f"✅ {len(cameras_inseridas)} câmeras inseridas/atualizadas no Supabase")
+                        for i, camera in enumerate(cameras_inseridas):
+                            log_info(f"   📹 Câmera {i+1}: {camera.get('nome', 'N/A')} (ID: {camera.get('id', 'N/A')})")
+                    else:
+                        log_warning(f"⚠️ Falha ao enviar informações das câmeras: {cameras_resultado.get('message', 'Erro desconhecido')}")
+                except Exception as e:
+                    log_error(f"❌ Erro ao enviar câmeras: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                log_warning("⚠️ Nenhuma câmera ONVIF detectada")
+            
+            # 8. Verificar se os dados foram realmente enviados
+            log_info("🔍 Verificando dados no Supabase...")
+            try:
+                response = self.supabase_manager.supabase.table('totens').select('*').eq('token', device_id).execute()
+                
+                if response.data:
+                    dados_verificacao = response.data[0]
+                    log_success("✅ Dados confirmados no Supabase:")
+                    log_info(f"   • Token: {dados_verificacao.get('token', 'N/A')[:8]}...")
+                    log_info(f"   • QR Code: {'✅ Presente' if dados_verificacao.get('qr_code_base64') else '❌ Ausente'}")
+                    log_info(f"   • Status: {dados_verificacao.get('status', 'N/A')}")
+                    
+                    # Marcar dispositivo como registrado
+                    self.device_registered = True
+                    return True
+                else:
+                    log_error("❌ Dados não encontrados no Supabase")
+                    return False
+                    
+            except Exception as e:
+                log_error(f"❌ Erro na verificação dos dados: {e}")
+                return False
+                
+        except Exception as e:
+            log_error(f"❌ Erro durante registro do dispositivo: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _check_arena_quadra_association_with_retry(self):
+        """
+        Verifica se o dispositivo está associado a uma arena/quadra com sistema de retry.
+        Verifica a cada 30 segundos por um período de 15 minutos.
+        Se não encontrar associação após 15 minutos, retorna falha.
+        
+        Returns:
+            dict: Resultado da verificação (sucesso ou falha após timeout)
+        """
+        import time
+        from datetime import datetime, timedelta
+        
+        # Configurações de retry
+        INTERVALO_VERIFICACAO = 30  # 30 segundos
+        TEMPO_LIMITE = 15 * 60      # 15 minutos em segundos
+        
+        inicio = datetime.now()
+        tempo_limite = inicio + timedelta(seconds=TEMPO_LIMITE)
+        tentativa = 1
+        
+        log_info(f"🔄 Iniciando verificação periódica de arena/quadra...")
+        log_info(f"⏱️ Verificações a cada {INTERVALO_VERIFICACAO} segundos por {TEMPO_LIMITE//60} minutos")
+        log_info(f"🕐 Início: {inicio.strftime('%H:%M:%S')} | Limite: {tempo_limite.strftime('%H:%M:%S')}")
+        
+        while datetime.now() < tempo_limite:
+            log_info(f"🔍 Tentativa {tentativa} - Verificando associação arena/quadra...")
+            
+            # Fazer a verificação
+            result = self._check_arena_quadra_association()
+            
+            if isinstance(result, dict) and result.get('success', False):
+                tempo_decorrido = (datetime.now() - inicio).total_seconds()
+                log_success(f"✅ Arena/Quadra encontrada após {tempo_decorrido:.1f} segundos!")
+                log_success(f"🏟️ Arena: {result['session_data']['arena_info']['nome']}")
+                log_success(f"🏟️ Quadra: {result['session_data']['quadra_info']['nome']}")
+                return result
+            
+            # Calcular tempo restante
+            tempo_restante = (tempo_limite - datetime.now()).total_seconds()
+            
+            if tempo_restante <= 0:
+                break
+                
+            # Mostrar status da tentativa
+            minutos_restantes = int(tempo_restante // 60)
+            segundos_restantes = int(tempo_restante % 60)
+            log_warning(f"⚠️ Arena/Quadra não encontrada. Tentando novamente em {INTERVALO_VERIFICACAO}s...")
+            log_info(f"⏳ Tempo restante: {minutos_restantes}m {segundos_restantes}s")
+            
+            # Aguardar antes da próxima tentativa
+            time.sleep(INTERVALO_VERIFICACAO)
+            tentativa += 1
+        
+        # Timeout atingido
+        tempo_total = (datetime.now() - inicio).total_seconds()
+        log_error(f"❌ Timeout atingido após {tempo_total:.1f} segundos ({tentativa-1} tentativas)")
+        log_error("💡 Para resolver:")
+        log_error("   1. Acesse o painel administrativo do Supabase")
+        log_error("   2. Associe este dispositivo a uma quadra válida")
+        log_error("   3. Verifique se a quadra está associada a uma arena")
+        
+        return {'success': False, 'message': 'Timeout: Arena/Quadra não associada após 15 minutos'}
+
+    def _check_arena_quadra_association(self):
+        """
+        Verifica se o dispositivo está associado a uma arena/quadra.
+        Método base usado pelas verificações periódicas.
+        
+        Returns:
+            dict: Resultado da verificação
+        """
+        try:
+            log_info("🏟️ Verificando associação arena/quadra...")
+            
+            device_id = self.device_manager.get_device_id()
+            if not device_id:
+                log_error("❌ Device ID não disponível")
+                return {'success': False, 'message': 'Device ID não disponível'}
+            
+            # Verificar se totem existe e tem quadra associada
+            try:
+                response = self.supabase_manager.supabase.table('totens').select('*').eq('token', device_id).execute()
+                
+                if not response.data:
+                    log_warning("⚠️ Totem não encontrado no Supabase")
+                    return {'success': False, 'message': 'Totem não encontrado'}
+                
+                totem_data = response.data[0]
+                quadra_id = totem_data.get('quadra_id')
+                
+                if not quadra_id:
+                    log_warning("⚠️ Totem não está associado a uma quadra")
+                    return {'success': False, 'message': 'Totem não associado a uma quadra'}
+                
+                # Buscar informações da quadra
+                quadra_result = self.supabase_manager.get_quadra_info(quadra_id)
+                if not quadra_result or not quadra_result.get('success'):
+                    log_error(f"❌ Quadra não encontrada: {quadra_id}")
+                    return {'success': False, 'message': f'Quadra não encontrada: {quadra_id}'}
+                
+                quadra_data = quadra_result['data']
+                arena_id = quadra_data.get('arena_id')
+                
+                if not arena_id:
+                    log_error("❌ Quadra não está associada a uma arena")
+                    return {'success': False, 'message': 'Quadra não associada a uma arena'}
+                
+                # Buscar informações da arena
+                arena_result = self.supabase_manager.get_arena_info(arena_id)
+                if not arena_result or not arena_result.get('success'):
+                    log_error(f"❌ Arena não encontrada: {arena_id}")
+                    return {'success': False, 'message': f'Arena não encontrada: {arena_id}'}
+                
+                arena_data = arena_result['data']
+                
+                log_success(f"✅ Dispositivo associado à quadra: {quadra_data.get('nome', 'N/A')}")
+                log_success(f"✅ Arena: {arena_data.get('nome', 'N/A')}")
+                
+                # Buscar câmeras associadas ao totem
+                cameras_response = self.supabase_manager.supabase.table('cameras').select('*').eq('totem_id', totem_data['id']).execute()
+                cameras_data = cameras_response.data if cameras_response.data else []
+                
+                # Criar dados da sessão
+                session_data = {
+                    'arena_info': {
+                        'id': arena_data.get('id'),
+                        'nome': arena_data.get('nome'),
+                        'nome_sanitizado': self._sanitize_name(arena_data.get('nome', ''))
+                    },
+                    'quadra_info': {
+                        'id': quadra_data.get('id'),
+                        'nome': quadra_data.get('nome'),
+                        'nome_sanitizado': self._sanitize_name(quadra_data.get('nome', ''))
+                    },
+                    'cameras': cameras_data
+                }
+                
+                return {
+                    'success': True,
+                    'session_data': session_data,
+                    'message': 'Associação encontrada'
+                }
+                
+            except Exception as e:
+                log_error(f"❌ Erro ao consultar Supabase: {e}")
+                return {'success': False, 'message': f'Erro na consulta: {e}'}
+                
+        except Exception as e:
+            log_error(f"❌ Erro ao verificar associação: {e}")
+            return {
+                'success': False,
+                'message': f'Erro na verificação: {e}'
+            }
+
+    def _sanitize_name(self, name):
+        """
+        Sanitiza nomes para uso em caminhos de arquivo.
+        
+        Args:
+            name (str): Nome para sanitizar
+            
+        Returns:
+            str: Nome sanitizado
+        """
+        if not name:
+            return 'desconhecido'
+        
+        # Remove caracteres especiais e substitui espaços por underscores
+        import re
+        sanitized = re.sub(r'[^\w\s-]', '', name)
+        sanitized = re.sub(r'[-\s]+', '_', sanitized)
+        return sanitized.lower()
+
+    def _generate_and_upload_qr_code(self, device_id, token):
+        """
+        Gera QR Code e converte para base64.
+        
+        Args:
+            device_id (str): ID do dispositivo
+            token (str): Token do dispositivo
+            
+        Returns:
+            str: QR Code em base64 ou None se falhar
+        """
+        try:
+            # Gerar QR Code
+            qr_data = {
+                'device_id': device_id,
+                'token': token,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+            
+            qr_result = self.qr_generator.generate_device_qr_code()
+            if 'error' in qr_result:
+                log_error(f"❌ Erro ao gerar QR Code: {qr_result['error']}")
+                return None
+            
+            qr_path = qr_result['files']['png_image']
+            if not qr_path or not os.path.exists(qr_path):
+                log_error("❌ Falha ao gerar arquivo QR Code")
+                return None
+            
+            # Converter para base64
+            import base64
+            with open(qr_path, 'rb') as qr_file:
+                qr_base64 = base64.b64encode(qr_file.read()).decode('utf-8')
+            
+            log_success(f"✅ QR Code convertido para base64 ({len(qr_base64)} caracteres)")
+            return qr_base64
+            
+        except Exception as e:
+            log_error(f"❌ Erro ao gerar/converter QR Code: {e}")
+            return None
 
 def main():
     """Função principal"""
